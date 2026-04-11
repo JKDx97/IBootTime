@@ -1,0 +1,114 @@
+import { useState, useEffect } from 'react'
+import { Monitor, Wifi } from 'lucide-react'
+import { GetConnectedClients } from '../../wailsjs/go/main/App'
+import { EventsOn } from '../../wailsjs/runtime/runtime'
+import clsx from 'clsx'
+
+const stateLabels = {
+  discovery: { text: 'Discovery', color: 'text-amber-400 bg-amber-500/10 border-amber-500/30' },
+  tftp: { text: 'TFTP Boot', color: 'text-blue-400 bg-blue-500/10 border-blue-500/30' },
+  menu: { text: 'In Menu', color: 'text-purple-400 bg-purple-500/10 border-purple-500/30' },
+  loading: { text: 'Loading', color: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30' },
+  completed: { text: 'Completed', color: 'text-slate-400 bg-slate-500/10 border-slate-500/30' },
+  error: { text: 'Error', color: 'text-red-400 bg-red-500/10 border-red-500/30' },
+}
+
+function ProgressBar({ value }) {
+  return (
+    <div className="w-full bg-slate-700 rounded-full h-2 overflow-hidden">
+      <div
+        className="h-full bg-emerald-500 rounded-full transition-all duration-300"
+        style={{ width: `${Math.min(100, Math.max(0, value))}%` }}
+      />
+    </div>
+  )
+}
+
+export default function ClientMonitor() {
+  const [clients, setClients] = useState([])
+
+  useEffect(() => {
+    GetConnectedClients().then((c) => setClients(c || []))
+
+    const unsub = EventsOn('client:updated', () => {
+      GetConnectedClients().then((c) => setClients(c || []))
+    })
+    return () => unsub()
+  }, [])
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h2 className="text-2xl font-bold text-white">Client Monitor</h2>
+        <span className="flex items-center gap-2 text-sm text-slate-400">
+          <Wifi size={14} />
+          {clients.length} client{clients.length !== 1 ? 's' : ''} connected
+        </span>
+      </div>
+
+      {clients.length === 0 ? (
+        <div className="bg-slate-900 rounded-xl border border-slate-700 p-12 text-center">
+          <Monitor size={48} className="mx-auto mb-3 text-slate-600" />
+          <p className="text-slate-400">No clients connected</p>
+          <p className="text-xs text-slate-600 mt-1">
+            Clients will appear here when they PXE boot from the network
+          </p>
+        </div>
+      ) : (
+        <div className="bg-slate-900 rounded-xl border border-slate-700 overflow-hidden">
+          <table className="w-full">
+            <thead>
+              <tr className="border-b border-slate-700 text-xs text-slate-400 uppercase tracking-wider">
+                <th className="text-left px-4 py-3">MAC Address</th>
+                <th className="text-left px-4 py-3">IP Address</th>
+                <th className="text-left px-4 py-3">Arch</th>
+                <th className="text-left px-4 py-3">Status</th>
+                <th className="text-left px-4 py-3">ISO</th>
+                <th className="text-left px-4 py-3 w-40">Progress</th>
+                <th className="text-right px-4 py-3">Speed</th>
+              </tr>
+            </thead>
+            <tbody>
+              {clients.map((client) => {
+                const stateInfo = stateLabels[client.state] || stateLabels.discovery
+                return (
+                  <tr key={client.mac} className="border-b border-slate-800 hover:bg-slate-800/50 transition-colors">
+                    <td className="px-4 py-3 font-mono text-sm text-slate-300">{client.mac}</td>
+                    <td className="px-4 py-3 font-mono text-sm text-white">{client.ip}</td>
+                    <td className="px-4 py-3 text-sm text-slate-400">{client.arch}</td>
+                    <td className="px-4 py-3">
+                      <span className={clsx(
+                        'text-xs px-2 py-0.5 rounded-full border',
+                        stateInfo.color
+                      )}>
+                        {stateInfo.text}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-sm text-blue-400">
+                      {client.isoName || '-'}
+                    </td>
+                    <td className="px-4 py-3">
+                      {client.state === 'loading' ? (
+                        <div className="flex items-center gap-2">
+                          <ProgressBar value={client.progress} />
+                          <span className="text-xs text-slate-400 w-10 text-right">
+                            {client.progress.toFixed(0)}%
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="text-xs text-slate-600">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-sm text-slate-400 text-right font-mono">
+                      {client.speed || '-'}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
