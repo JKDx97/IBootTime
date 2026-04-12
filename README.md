@@ -102,8 +102,8 @@ go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
 ```bash
 # Clone the repository
-git clone https://github.com/JKDx97/BootTime.git
-cd BootTime
+git clone https://github.com/JKDx97/IBootTime.git
+cd IBootTime
 
 # Install frontend dependencies
 cd frontend

@@ -42,6 +42,8 @@ type Server struct {
 	bootWimCache sync.Map
 	// Results from background Windows ISO preparation: isoPath -> shareName (string)
 	winPrepResults sync.Map
+	// Drive letter assigned to each Windows ISO: isoPath -> driveLetter (string, e.g. "Z")
+	winDriveLetters sync.Map
 }
 
 func New(port int, serverIP string, isoMgr *isomgr.Manager, log *logger.Logger, sessions *session.Manager, cfg *config.Config) *Server {
@@ -89,10 +91,13 @@ func (s *Server) Start(ctx context.Context) error {
 		s.httpServer.Shutdown(shutdownCtx)
 	}()
 
-	// Phase 1: Mount ALL ISOs and create SMB shares immediately (fast, ~5s per ISO)
+	// Pre-load cached boot.wim files from disk (instant — no DISM needed)
+	s.preloadBootWimCache()
+
+	// Phase 1: Mount ALL ISOs and create SMB shares (fast, ~5s per ISO)
+	// Phase 2: DISM modify boot.wim for Windows ISOs (only if cache is stale)
 	go func() {
 		s.shareAllISOs()
-		// Phase 2: DISM modify boot.wim for Windows ISOs (slow, runs in background)
 		s.prepareWindowsBootWims()
 	}()
 
@@ -122,16 +127,49 @@ func (s *Server) cleanupSMBShares() {
 	})
 }
 
-const smbUser = "admin"
-const smbPass = "123456"
+const smbUser = "Administrador"
+const smbPass = "P0s31d0n"
+const cacheVersion = "v11-serial-dism"
+
+// preloadBootWimCache scans disk for previously cached boot.wim files and
+// populates in-memory maps so modified boot.wim is served instantly on startup.
+func (s *Server) preloadBootWimCache() {
+	isos := s.isoMgr.ListEnabled()
+	nextLetter := byte('Z')
+	for _, iso := range isos {
+		if iso.OSType != isomgr.OSTypeWindows && iso.OSType != isomgr.OSTypeWinPE {
+			continue
+		}
+		// Assign drive letter
+		letter := string(nextLetter)
+		s.winDriveLetters.Store(iso.Path, letter)
+		if nextLetter > 'N' {
+			nextLetter--
+		}
+
+		// Check if valid cached boot.wim exists on disk
+		cacheID := sanitizeMenuID(iso.Name)
+		isoDir := filepath.Dir(iso.Path)
+		cacheDir := filepath.Join(isoDir, ".bootcache", cacheID)
+		cachedWim := filepath.Join(cacheDir, "boot.wim")
+		versionFile := filepath.Join(cacheDir, ".version")
+
+		if _, err := os.Stat(cachedWim); err != nil {
+			continue
+		}
+		if data, err := os.ReadFile(versionFile); err != nil || string(data) != cacheVersion {
+			continue
+		}
+
+		s.bootWimCache.Store(iso.Path, cachedWim)
+		s.log.Info("HTTP", "Pre-loaded cached boot.wim for %s (drive %s:)", iso.Name, letter)
+	}
+}
 
 // shareAllISOs mounts ALL enabled ISOs and creates SMB shares immediately.
 // This is fast (~5s per ISO) and runs at server start.
 func (s *Server) shareAllISOs() {
 	s.log.Info("HTTP", "=== Creating SMB shares for all ISOs ===")
-
-	// Clean stale net use connections from previous sessions
-	exec.Command("net", "use", "*", "/delete", "/yes").Run()
 
 	isos := s.isoMgr.ListEnabled()
 	for _, iso := range isos {
@@ -180,32 +218,33 @@ func (s *Server) countShares() int {
 // Runs in background after shares are created.
 func (s *Server) prepareWindowsBootWims() {
 	isos := s.isoMgr.ListEnabled()
-	var wg sync.WaitGroup
+	nextLetter := byte('Z')
+	// DISM operations MUST run sequentially — concurrent WIM mounts cause failures
 	for _, iso := range isos {
 		if iso.OSType != isomgr.OSTypeWindows && iso.OSType != isomgr.OSTypeWinPE {
 			continue
 		}
-		wg.Add(1)
-		go func(iso isomgr.ISOInfo) {
-			defer wg.Done()
-			shareName, err := s.prepareWindowsInstall(&iso)
-			if err != nil {
-				s.log.Warn("HTTP", "DISM prep failed for %s: %v", iso.Name, err)
-				s.winPrepResults.Store(iso.Path, "")
-			} else {
-				s.winPrepResults.Store(iso.Path, shareName)
-				s.log.Info("HTTP", "DISM prep complete for %s (share: %s)", iso.Name, shareName)
-			}
-		}(iso)
+		letter := string(nextLetter)
+		s.winDriveLetters.Store(iso.Path, letter)
+		if nextLetter > 'N' {
+			nextLetter--
+		}
+		shareName, err := s.prepareWindowsInstall(&iso, letter)
+		if err != nil {
+			s.log.Warn("HTTP", "DISM prep failed for %s: %v", iso.Name, err)
+			s.winPrepResults.Store(iso.Path, "")
+		} else {
+			s.winPrepResults.Store(iso.Path, shareName)
+			s.log.Info("HTTP", "DISM prep complete for %s (share: %s, drive: %s:)", iso.Name, shareName, letter)
+		}
 	}
-	wg.Wait()
 	s.log.Info("HTTP", "All Windows boot.wim preparations finished")
 }
 
 // prepareWindowsInstall mounts a Windows ISO, creates an SMB share, and
 // produces a modified boot.wim with an injected startnet.cmd that automatically
 // connects to the SMB share and launches setup.exe. Returns the share name.
-func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo) (string, error) {
+func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) (string, error) {
 	// Check if already prepared
 	if cached, ok := s.bootWimCache.Load(iso.Path); ok {
 		shareName := "IB_" + sanitizeMenuID(iso.Name)
@@ -218,7 +257,7 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo) (string, error) {
 	s.log.Info("HTTP", "=== Preparing Windows install for %s ===", iso.Name)
 
 	// 1. Mount ISO
-	driveLetter, err := s.mountISO(iso.Path)
+	isoDrive, err := s.mountISO(iso.Path)
 	if err != nil {
 		return "", fmt.Errorf("mount ISO: %w", err)
 	}
@@ -226,14 +265,14 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo) (string, error) {
 	// 2. Verify boot.wim exists on mounted drive
 	srcBootWim := ""
 	for _, candidate := range []string{"sources\\boot.wim", "Sources\\boot.wim", "SOURCES\\BOOT.WIM"} {
-		p := filepath.Join(driveLetter+":\\", candidate)
+		p := filepath.Join(isoDrive+":\\", candidate)
 		if _, err := os.Stat(p); err == nil {
 			srcBootWim = p
 			break
 		}
 	}
 	if srcBootWim == "" {
-		return "", fmt.Errorf("boot.wim not found on mounted ISO %s (%s:\\)", iso.Name, driveLetter)
+		return "", fmt.Errorf("boot.wim not found on mounted ISO %s (%s:\\)", iso.Name, isoDrive)
 	}
 	s.log.Info("HTTP", "Found boot.wim: %s", srcBootWim)
 
@@ -254,7 +293,6 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo) (string, error) {
 	needRebuild := wimErr != nil || (isoStat != nil && wimStat.ModTime().Before(isoStat.ModTime()))
 
 	// Version marker — if injection logic changes, bump this to force rebuild
-	const cacheVersion = "v8-admin-creds"
 	versionFile := filepath.Join(cacheDir, ".version")
 	if versionData, err := os.ReadFile(versionFile); err == nil && string(versionData) == cacheVersion {
 		needRebuild = needRebuild // keep existing decision
@@ -321,22 +359,43 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo) (string, error) {
 			}
 			s.log.Info("HTTP", "DISM mount index %d OK", idx)
 
+			// -- Inject NIC drivers (critical for Win11 WinPE networking) --
+			if driverDir := s.findDriversDir(); driverDir != "" {
+				s.log.Info("HTTP", "DISM: injecting drivers from %s into index %d...", driverDir, idx)
+				dismDriver := exec.Command("dism", "/image:"+idxMountDir,
+					"/add-driver", "/driver:"+driverDir, "/recurse", "/forceunsigned")
+				if out, err := dismDriver.CombinedOutput(); err != nil {
+					s.log.Warn("HTTP", "Driver injection index %d (non-fatal): %v\n%s", idx, err, strings.TrimSpace(string(out)))
+				} else {
+					s.log.Info("HTTP", "Drivers injected into index %d OK", idx)
+				}
+			}
+
 			// -- Inject startnet.cmd --
 			startnetPath := filepath.Join(idxMountDir, "Windows", "System32", "startnet.cmd")
 			var startnetContent string
 
 			if idx >= 2 {
 				// Index 2+ (Windows Setup): wpeinit handled by winpeshl.ini.
-				// startnet.cmd: wait for network, map Z: via IP with user/pass, launch setup.
+				// startnet.cmd: force network init, wait for network, map drive via IP with user/pass, launch setup.
 				startnetContent = fmt.Sprintf("@echo off\r\n"+
-					"echo [IBootTime] Esperando red...\r\n"+
+					"echo [IBootTime] Inicializando red...\r\n"+
+					"wpeutil initializenetwork >nul 2>&1\r\n"+
+					"wpeutil waitfornetwork >nul 2>&1\r\n"+
+					"ping -n 3 127.0.0.1 >nul\r\n"+
+					"ipconfig /renew >nul 2>&1\r\n"+
+					"ping -n 2 127.0.0.1 >nul\r\n"+
+					"echo.\r\n"+
+					"ipconfig\r\n"+
+					"echo.\r\n"+
+					"echo [IBootTime] Esperando conexion con %s ...\r\n"+
 					":waitnet\r\n"+
 					"ping -n 1 -w 1000 %s >nul 2>&1\r\n"+
 					"if errorlevel 1 goto waitnet\r\n"+
 					"echo [IBootTime] Conectando \\\\%s\\%s ...\r\n"+
 					"set R=0\r\n"+
 					":retry\r\n"+
-					"net use Z: \\\\%s\\%s /user:%s %s /persistent:yes >nul 2>&1\r\n"+
+					"net use %s: \\\\%s\\%s /user:%s %s /persistent:yes >nul 2>&1\r\n"+
 					"if not errorlevel 1 goto ok\r\n"+
 					"set /a R+=1\r\n"+
 					"if %%R%% GEQ 20 goto fail\r\n"+
@@ -344,32 +403,51 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo) (string, error) {
 					"ping -n 3 127.0.0.1 >nul\r\n"+
 					"goto retry\r\n"+
 					":ok\r\n"+
-					"echo [IBootTime] Z: conectada. Lanzando instalador...\r\n"+
-					"Z:\\setup.exe\r\n"+
-					"exit /b 0\r\n"+
+					"echo [IBootTime] %s: conectada. Lanzando instalador...\r\n"+
+					"%s:\\setup.exe\r\n"+
+					"echo.\r\n"+
+					"echo [IBootTime] El instalador se cerro o fallo.\r\n"+
+					"echo Para reintentar: %s:\\setup.exe\r\n"+
+					"cmd /k\r\n"+
 					":fail\r\n"+
 					"echo [IBootTime] Error de conexion.\r\n"+
-					"echo Escribe: net use Z: \\\\%s\\%s /user:%s %s\r\n"+
-					"echo Luego: Z:\\setup.exe\r\n"+
+					"echo.\r\n"+
+					"ipconfig\r\n"+
+					"echo.\r\n"+
+					"echo Escribe: net use %s: \\\\%s\\%s /user:%s %s\r\n"+
+					"echo Luego: %s:\\setup.exe\r\n"+
 					"cmd /k\r\n",
 					s.serverIP,
+					s.serverIP,
 					s.serverIP, shareName,
-					s.serverIP, shareName, smbUser, smbPass,
-					s.serverIP, shareName, smbUser, smbPass,
+					driveLetter, s.serverIP, shareName, smbUser, smbPass,
+					driveLetter,
+					driveLetter,
+					driveLetter,
+					driveLetter, s.serverIP, shareName, smbUser, smbPass,
+					driveLetter,
 				)
 			} else {
-				// Index 1 (plain WinPE): wpeinit + wait for IP + net use with user/pass
+				// Index 1 (plain WinPE): wpeinit + network init + wait for IP + net use
 				startnetContent = fmt.Sprintf("@echo off\r\n"+
 					"echo [IBootTime] Inicializando red...\r\n"+
 					"wpeinit\r\n"+
-					"echo [IBootTime] Esperando red...\r\n"+
+					"wpeutil initializenetwork >nul 2>&1\r\n"+
+					"wpeutil waitfornetwork >nul 2>&1\r\n"+
+					"ping -n 3 127.0.0.1 >nul\r\n"+
+					"ipconfig /renew >nul 2>&1\r\n"+
+					"ping -n 2 127.0.0.1 >nul\r\n"+
+					"echo.\r\n"+
+					"ipconfig\r\n"+
+					"echo.\r\n"+
+					"echo [IBootTime] Esperando conexion con %s ...\r\n"+
 					":waitnet\r\n"+
 					"ping -n 1 -w 1000 %s >nul 2>&1\r\n"+
 					"if errorlevel 1 goto waitnet\r\n"+
 					"echo [IBootTime] Conectando \\\\%s\\%s ...\r\n"+
 					"set RETRIES=0\r\n"+
 					":retry\r\n"+
-					"net use Z: \\\\%s\\%s /user:%s %s /persistent:yes >nul 2>&1\r\n"+
+					"net use %s: \\\\%s\\%s /user:%s %s /persistent:yes >nul 2>&1\r\n"+
 					"if not errorlevel 1 goto connected\r\n"+
 					"set /a RETRIES+=1\r\n"+
 					"if %%RETRIES%% GEQ 15 goto manual\r\n"+
@@ -377,19 +455,29 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo) (string, error) {
 					"ping -n 3 127.0.0.1 >nul\r\n"+
 					"goto retry\r\n"+
 					":connected\r\n"+
-					"echo [IBootTime] Z: conectada. Lanzando instalador...\r\n"+
-					"Z:\\setup.exe\r\n"+
-					"goto end\r\n"+
+					"echo [IBootTime] %s: conectada. Lanzando instalador...\r\n"+
+					"%s:\\setup.exe\r\n"+
+					"echo.\r\n"+
+					"echo [IBootTime] El instalador se cerro o fallo.\r\n"+
+					"echo Para reintentar: %s:\\setup.exe\r\n"+
+					"cmd /k\r\n"+
 					":manual\r\n"+
 					"echo [IBootTime] Error de conexion.\r\n"+
-					"echo Escribe: net use Z: \\\\%s\\%s /user:%s %s\r\n"+
-					"echo Luego: Z:\\setup.exe\r\n"+
-					"cmd /k\r\n"+
-					":end\r\n",
+					"echo.\r\n"+
+					"ipconfig\r\n"+
+					"echo.\r\n"+
+					"echo Escribe: net use %s: \\\\%s\\%s /user:%s %s\r\n"+
+					"echo Luego: %s:\\setup.exe\r\n"+
+					"cmd /k\r\n",
+					s.serverIP,
 					s.serverIP,
 					s.serverIP, shareName,
-					s.serverIP, shareName, smbUser, smbPass,
-					s.serverIP, shareName, smbUser, smbPass,
+					driveLetter, s.serverIP, shareName, smbUser, smbPass,
+					driveLetter,
+					driveLetter,
+					driveLetter,
+					driveLetter, s.serverIP, shareName, smbUser, smbPass,
+					driveLetter,
 				)
 			}
 
@@ -466,6 +554,26 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// findDriversDir locates the drivers/ directory for NIC driver injection.
+// Searches relative to the executable and the working directory.
+func (s *Server) findDriversDir() string {
+	candidates := []string{"drivers"}
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		candidates = append([]string{
+			filepath.Join(exeDir, "drivers"),
+			filepath.Join(exeDir, "..", "drivers"),
+		}, candidates...)
+	}
+	for _, dir := range candidates {
+		absDir, _ := filepath.Abs(dir)
+		if info, err := os.Stat(absDir); err == nil && info.IsDir() {
+			return absDir
+		}
+	}
+	return ""
 }
 
 // mountISO mounts an ISO using Windows' built-in Mount-DiskImage and returns
@@ -566,48 +674,59 @@ func (s *Server) handleBootScript(w http.ResponseWriter, r *http.Request) {
 
 		switch iso.OSType {
 		case isomgr.OSTypeWindows, isomgr.OSTypeWinPE:
-			// Windows: wimboot with modified boot.wim (startnet.cmd auto-connects
-			// SMB share and launches Z:\setup.exe).
-			// No sanboot fallback — doesn't work on BIOS (floods server, disconnects).
-			var shareName string
-			prepReady := false
-			if result, ok := s.winPrepResults.Load(iso.Path); ok {
-				shareName = result.(string)
-				prepReady = true
+			// Windows: wimboot loads BCD + boot.sdi + boot.wim via HTTP.
+			// boot.wim endpoint auto-serves modified version (with startnet.cmd
+			// that does net use) when ready, or original from ISO otherwise.
+			shareName := "IB_" + sanitizeMenuID(iso.Name)
+			dl := "Z"
+			if letter, ok := s.winDriveLetters.Load(iso.Path); ok {
+				dl = letter.(string)
 			}
-			_, hasModifiedWim := s.bootWimCache.Load(iso.Path)
 
-			if prepReady && hasModifiedWim {
-				script.WriteString("imgfree\n")
-				script.WriteString(fmt.Sprintf("echo Instalacion de %s via red (SMB)...\n", iso.Name))
-				script.WriteString(fmt.Sprintf("kernel ${boot-url}/wimboot || goto winfail_%s\n", itemID))
-				script.WriteString(fmt.Sprintf("initrd --name BCD ${boot-url}/iso/%s/file/boot/bcd BCD || goto winfail_%s\n", encodedName, itemID))
-				script.WriteString(fmt.Sprintf("initrd --name boot.sdi ${boot-url}/iso/%s/file/boot/boot.sdi boot.sdi || goto winfail_%s\n", encodedName, itemID))
-				script.WriteString(fmt.Sprintf("initrd --name boot.wim ${boot-url}/iso/%s/file/sources/boot.wim boot.wim || goto winfail_%s\n", encodedName, itemID))
-				script.WriteString(fmt.Sprintf("boot || goto winfail_%s\n", itemID))
-				// Failure handler
-				script.WriteString(fmt.Sprintf(":winfail_%s\n", itemID))
-				script.WriteString("echo\n")
-				script.WriteString("echo =============================================\n")
-				script.WriteString(fmt.Sprintf("echo   Error cargando %s\n", iso.Name))
-				if shareName != "" {
-					script.WriteString("echo   Si llegas a Windows PE, presiona Shift+F10:\n")
-					script.WriteString("echo     wpeinit\n")
-					script.WriteString(fmt.Sprintf("echo     net use Z: \\\\%s\\%s\n", s.serverIP, shareName))
-					script.WriteString("echo     Z:\\setup.exe\n")
-				}
-				script.WriteString("echo =============================================\n")
-				script.WriteString("prompt Presiona ENTER para volver al menu...\n")
-				script.WriteString("goto start\n\n")
-			} else {
-				// Prep not ready — auto-retry: reload boot.ipxe every 5s until ready
-				s.log.Info("HTTP", "Windows prep not ready for %s, client will auto-retry", iso.Name)
-				script.WriteString("echo\n")
-				script.WriteString(fmt.Sprintf("echo %s: Servidor preparando instalacion...\n", iso.Name))
-				script.WriteString("echo Reintentando automaticamente en 5 segundos...\n")
-				script.WriteString("sleep 5\n")
-				script.WriteString("chain ${boot-url}/boot.ipxe\n\n")
-			}
+			script.WriteString("imgfree\n")
+			script.WriteString(fmt.Sprintf("echo Instalacion de %s via red...\n", iso.Name))
+			// Detect UEFI vs BIOS — wimboot on UEFI REQUIRES bootx64.efi
+			script.WriteString(fmt.Sprintf("iseq ${platform} efi && goto win_uefi_%s ||\n\n", itemID))
+
+			// ==== BIOS path ====
+			script.WriteString(fmt.Sprintf(":win_bios_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("kernel ${boot-url}/wimboot || goto winfail_%s\n", itemID))
+			// BCD: try boot/bcd (BIOS) first, then efi/microsoft/boot/bcd
+			script.WriteString(fmt.Sprintf("initrd --name BCD ${boot-url}/iso/%s/file/boot/bcd BCD || goto win_bcd_efi_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf("goto win_sdi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf(":win_bcd_efi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("initrd --name BCD ${boot-url}/iso/%s/file/efi/microsoft/boot/bcd BCD || goto winfail_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf(":win_sdi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("initrd --name boot.sdi ${boot-url}/iso/%s/file/boot/boot.sdi boot.sdi || goto winfail_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf("initrd --name boot.wim ${boot-url}/iso/%s/file/sources/boot.wim boot.wim || goto winfail_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf("boot || goto winfail_%s\n\n", itemID))
+
+			// ==== UEFI path ====
+			script.WriteString(fmt.Sprintf(":win_uefi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("kernel ${boot-url}/wimboot || goto winfail_%s\n", itemID))
+			// UEFI: bootx64.efi is REQUIRED for wimboot to hand off to Windows Boot Manager
+			script.WriteString(fmt.Sprintf("initrd --name bootx64.efi ${boot-url}/iso/%s/file/efi/boot/bootx64.efi bootx64.efi || goto winfail_%s\n", encodedName, itemID))
+			// BCD: try efi/microsoft/boot/bcd first, then boot/bcd
+			script.WriteString(fmt.Sprintf("initrd --name BCD ${boot-url}/iso/%s/file/efi/microsoft/boot/bcd BCD || goto win_uefi_bcd_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf("goto win_uefi_sdi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf(":win_uefi_bcd_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("initrd --name BCD ${boot-url}/iso/%s/file/boot/bcd BCD || goto winfail_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf(":win_uefi_sdi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("initrd --name boot.sdi ${boot-url}/iso/%s/file/boot/boot.sdi boot.sdi || goto winfail_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf("initrd --name boot.wim ${boot-url}/iso/%s/file/sources/boot.wim boot.wim || goto winfail_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf("boot || goto winfail_%s\n", itemID))
+			// Failure handler
+			script.WriteString(fmt.Sprintf(":winfail_%s\n", itemID))
+			script.WriteString("echo\n")
+			script.WriteString("echo =============================================\n")
+			script.WriteString(fmt.Sprintf("echo   Error cargando %s\n", iso.Name))
+			script.WriteString("echo   Si llegas a Windows PE, presiona Shift+F10:\n")
+			script.WriteString("echo     wpeinit\n")
+			script.WriteString(fmt.Sprintf("echo     net use %s: \\\\%s\\%s /user:%s %s\n", dl, s.serverIP, shareName, smbUser, smbPass))
+			script.WriteString(fmt.Sprintf("echo     %s:\\setup.exe\n", dl))
+			script.WriteString("echo =============================================\n")
+			script.WriteString("prompt Presiona ENTER para volver al menu...\n")
+			script.WriteString("goto start\n\n")
 
 		case isomgr.OSTypeLinux:
 			// Linux: try kernel+initrd (casper, live, isolinux), sanboot fallback

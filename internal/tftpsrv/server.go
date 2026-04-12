@@ -267,11 +267,36 @@ func (s *Server) serveIPXEScript(rf io.ReaderFrom) error {
 
 		switch iso.OSType {
 		case isomgr.OSTypeWindows, isomgr.OSTypeWinPE:
-			script.WriteString("kernel ${http-root}/wimboot\n")
-			script.WriteString(fmt.Sprintf("initrd --name BCD ${http-root}/iso/%s/file/boot/bcd BCD ||\n", encodedName))
-			script.WriteString(fmt.Sprintf("initrd --name BCD ${http-root}/iso/%s/file/efi/microsoft/boot/bcd BCD ||\n", encodedName))
-			script.WriteString(fmt.Sprintf("initrd --name boot.sdi ${http-root}/iso/%s/file/boot/boot.sdi boot.sdi\n", encodedName))
-			script.WriteString(fmt.Sprintf("initrd --name boot.wim ${http-root}/iso/%s/file/sources/boot.wim boot.wim\n", encodedName))
+			// Detect UEFI vs BIOS — wimboot on UEFI REQUIRES bootx64.efi
+			script.WriteString(fmt.Sprintf("imgfree\n"))
+			script.WriteString(fmt.Sprintf("iseq ${platform} efi && goto win_uefi_%s ||\n\n", itemID))
+
+			// ==== BIOS path ====
+			script.WriteString(fmt.Sprintf(":win_bios_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("kernel ${http-root}/wimboot || goto failed\n"))
+			// BCD: try boot/bcd (BIOS) first, then efi/microsoft/boot/bcd
+			script.WriteString(fmt.Sprintf("initrd --name BCD ${http-root}/iso/%s/file/boot/bcd BCD || goto win_bcd_efi_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf("goto win_sdi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf(":win_bcd_efi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("initrd --name BCD ${http-root}/iso/%s/file/efi/microsoft/boot/bcd BCD || goto failed\n", encodedName))
+			script.WriteString(fmt.Sprintf(":win_sdi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("initrd --name boot.sdi ${http-root}/iso/%s/file/boot/boot.sdi boot.sdi || goto failed\n", encodedName))
+			script.WriteString(fmt.Sprintf("initrd --name boot.wim ${http-root}/iso/%s/file/sources/boot.wim boot.wim || goto failed\n", encodedName))
+			script.WriteString("boot || goto failed\n\n")
+
+			// ==== UEFI path ====
+			script.WriteString(fmt.Sprintf(":win_uefi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("kernel ${http-root}/wimboot || goto failed\n"))
+			// UEFI: bootx64.efi is REQUIRED for wimboot to hand off to Windows Boot Manager
+			script.WriteString(fmt.Sprintf("initrd --name bootx64.efi ${http-root}/iso/%s/file/efi/boot/bootx64.efi bootx64.efi || goto failed\n", encodedName))
+			// BCD: try efi/microsoft/boot/bcd first, then boot/bcd
+			script.WriteString(fmt.Sprintf("initrd --name BCD ${http-root}/iso/%s/file/efi/microsoft/boot/bcd BCD || goto win_uefi_bcd_%s\n", encodedName, itemID))
+			script.WriteString(fmt.Sprintf("goto win_uefi_sdi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf(":win_uefi_bcd_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("initrd --name BCD ${http-root}/iso/%s/file/boot/bcd BCD || goto failed\n", encodedName))
+			script.WriteString(fmt.Sprintf(":win_uefi_sdi_%s\n", itemID))
+			script.WriteString(fmt.Sprintf("initrd --name boot.sdi ${http-root}/iso/%s/file/boot/boot.sdi boot.sdi || goto failed\n", encodedName))
+			script.WriteString(fmt.Sprintf("initrd --name boot.wim ${http-root}/iso/%s/file/sources/boot.wim boot.wim || goto failed\n", encodedName))
 			script.WriteString("boot || goto failed\n\n")
 
 		case isomgr.OSTypeLinux:
