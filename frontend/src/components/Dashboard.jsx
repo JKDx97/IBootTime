@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
-import { Power, Wifi, Server, HardDrive, ScrollText, Monitor, Layers, Terminal, Cpu } from 'lucide-react'
-import { StartServer, StopServer, GetServerStatus, IsServerRunning, GetConnectedClients, GetRecentLogs, GetBootProtocol } from '../../wailsjs/go/main/App'
-import { EventsOn } from '../../wailsjs/runtime/runtime'
+import { Power, Wifi, Server, HardDrive, ScrollText, Monitor, Layers, Terminal, Cpu, ScreenShare } from 'lucide-react'
+import { StartServer, StopServer, GetServerStatus, IsServerRunning, GetConnectedClients, GetRecentLogs, GetBootProtocol, TriggerRemote } from '../../wailsjs/go/main/App'
+import { BrowserOpenURL, EventsOn } from '../../wailsjs/runtime/runtime'
 import clsx from 'clsx'
 
 function StatusCard({ label, active, icon: Icon }) {
@@ -24,6 +24,29 @@ function StatusCard({ label, active, icon: Icon }) {
         active ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]' : 'bg-slate-600'
       )} />
     </div>
+  )
+}
+
+function CircularProgress({ progress, size = 128, strokeWidth = 6 }) {
+  const radius = (size - strokeWidth) / 2
+  const circumference = 2 * Math.PI * radius
+  const offset = circumference - (progress / 100) * circumference
+  return (
+    <svg width={size} height={size} className="transform -rotate-90">
+      <circle cx={size/2} cy={size/2} r={radius}
+        fill="none" stroke="#1e293b" strokeWidth={strokeWidth} />
+      <circle cx={size/2} cy={size/2} r={radius}
+        fill="none" stroke="url(#progressGrad)" strokeWidth={strokeWidth}
+        strokeDasharray={circumference} strokeDashoffset={offset}
+        strokeLinecap="round"
+        className="transition-all duration-500" />
+      <defs>
+        <linearGradient id="progressGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stopColor="#34d399" />
+          <stop offset="100%" stopColor="#3b82f6" />
+        </linearGradient>
+      </defs>
+    </svg>
   )
 }
 
@@ -110,6 +133,7 @@ export default function Dashboard() {
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-1 flex flex-col items-center justify-center bg-slate-900 rounded-2xl border border-slate-700 p-8">
+          {/* Power button — always visible */}
           <button
             onClick={handleToggle}
             disabled={loading}
@@ -124,10 +148,29 @@ export default function Dashboard() {
             <Power size={48} className={running ? 'text-red-400' : 'text-emerald-400'} />
           </button>
           <p className={clsx('mt-4 text-lg font-bold', running ? 'text-red-400' : 'text-emerald-400')}>
-            {loading ? 'Procesando...' : running ? 'Detener Servidor' : 'Iniciar Servidor'}
+            {loading ? 'Procesando...' : running ? 'Servidor Iniciado' : 'Iniciar Servidor'}
           </p>
+          {running && (
+            <p className="text-xs text-slate-500 mt-0.5">Presiona para detener</p>
+          )}
+          {/* Background ISO prep banner */}
+          {running && status.startupPhase === 'preparing' && (
+            <div className="mt-3 w-full max-w-xs">
+              <div className="flex items-center gap-2 text-xs text-blue-400 mb-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+                <span className="truncate">{status.startupDetail || 'Preparando ISOs...'}</span>
+                <span className="ml-auto shrink-0">{status.startupProgress || 0}%</span>
+              </div>
+              <div className="w-full bg-slate-700 rounded-full h-1.5 overflow-hidden">
+                <div
+                  className="h-full bg-blue-500 rounded-full transition-all duration-500"
+                  style={{ width: `${status.startupProgress || 0}%` }}
+                />
+              </div>
+            </div>
+          )}
           {status.ip && (
-            <p className="text-sm text-slate-400 mt-1">
+            <p className="text-sm text-slate-400 mt-2">
               IP: <span className="text-white font-mono">{status.ip}</span>
             </p>
           )}
@@ -168,14 +211,38 @@ export default function Dashboard() {
             {clients.length === 0 ? (
               <p className="text-xs text-slate-500 py-2">No hay clientes conectados</p>
             ) : (
-              <div className="space-y-1.5 max-h-32 overflow-auto">
+              <div className="space-y-1.5 max-h-40 overflow-auto">
                 {clients.map((c) => (
-                  <div key={c.mac} className="flex items-center text-xs bg-slate-800 rounded-lg px-3 py-1.5">
+                  <div key={c.mac} className="flex items-center text-xs bg-slate-800 rounded-lg px-3 py-1.5 gap-2">
                     <span className="font-mono text-slate-400 w-36">{c.mac}</span>
                     <span className="text-white w-28">{c.ip}</span>
                     <span className="text-blue-400 flex-1">{c.isoName || c.state}</span>
                     {c.progress > 0 && (
-                      <span className="text-emerald-400">{c.progress.toFixed(1)}%</span>
+                      <span className="text-emerald-400 shrink-0">{c.progress.toFixed(1)}%</span>
+                    )}
+                    {c.remoteAvailable ? (
+                      <button
+                        onClick={async () => {
+                          try {
+                            setError('')
+                            await TriggerRemote(c.ip)
+                            const url = `http://${status.ip}:${status.httpPort || 8080}/novnc?host=${c.ip}&port=${c.remoteVncPort || 5900}&password=${c.remotePassword || ''}&mode=reverse`
+                            BrowserOpenURL(url)
+                          } catch (e) {
+                            setError(`VNC trigger failed: ${e}`)
+                          }
+                        }}
+                        className="shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30 transition-colors"
+                        title="Enviar orden de conexion VNC al cliente"
+                      >
+                        <ScreenShare size={12} />
+                        <span>Conectar</span>
+                      </button>
+                    ) : (
+                      <span className="shrink-0 text-slate-600 flex items-center gap-1">
+                        <ScreenShare size={12} />
+                        <span>Sin VNC</span>
+                      </span>
                     )}
                   </div>
                 ))}

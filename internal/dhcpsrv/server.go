@@ -44,6 +44,16 @@ const (
 	optEnd          = 255
 )
 
+// uefiPoolStart/uefiPoolSize define a small IP range for UEFI PXE clients.
+// UEFI firmware requires a real IP in the DHCP OFFER (yiaddr != 0);
+// proxy mode (yiaddr=0) causes UEFI to show 0.0.0.0 or ignore the OFFER.
+// We assign .200-.219 in the server's subnet. These IPs are temporary —
+// once iPXE chainloads it does its own DHCP with the router.
+const (
+	uefiPoolStart = 200
+	uefiPoolSize  = 20
+)
+
 type Server struct {
 	mu         sync.Mutex
 	conn       *net.UDPConn
@@ -53,6 +63,8 @@ type Server struct {
 	log        *logger.Logger
 	sessions   *session.Manager
 	serverIP   net.IP
+	subnetMask net.IP
+	gatewayIP  net.IP // router/gateway IP (first usable IP in subnet)
 	bcastIP    net.IP // subnet-directed broadcast (e.g. 192.168.1.255)
 	cancelFunc context.CancelFunc
 	running    bool
@@ -65,9 +77,13 @@ type Server struct {
 	// Stores time.Time of last PXE interaction; expires after pxeClientTTL
 	// to avoid interfering with the booted OS's regular DHCP.
 	pxeClients sync.Map // MAC -> time.Time
+
+	// UEFI IP pool: MAC -> assigned IP (net.IP)
+	uefiLeases sync.Map
+	uefiNextIdx int // next index into the pool (round-robin)
 }
 
-func New(cfg *config.Config, serverIP string, log *logger.Logger, sessions *session.Manager) *Server {
+func New(cfg *config.Config, serverIP, gatewayIP string, log *logger.Logger, sessions *session.Manager) *Server {
 	sip := net.ParseIP(serverIP).To4()
 
 	// Calculate subnet-directed broadcast (assume /24 — router handles real subnet)
@@ -77,12 +93,21 @@ func New(cfg *config.Config, serverIP string, log *logger.Logger, sessions *sess
 		bcast[i] = sip[i] | ^mask[i]
 	}
 
+	gw := net.ParseIP(gatewayIP).To4()
+	if gw == nil {
+		gw = make(net.IP, 4)
+		copy(gw, sip)
+		gw[3] = 1
+	}
+
 	return &Server{
-		cfg:      cfg,
-		log:      log,
-		sessions: sessions,
-		serverIP: sip,
-		bcastIP:  bcast,
+		cfg:        cfg,
+		log:        log,
+		sessions:   sessions,
+		serverIP:   sip,
+		subnetMask: mask,
+		gatewayIP:  gw,
+		bcastIP:    bcast,
 	}
 }
 
@@ -295,19 +320,24 @@ func (s *Server) handlePacket(data []byte, remoteAddr *net.UDPAddr, conn *net.UD
 		return
 	}
 
-	// --- Port 67: Proxy PXE responses ---
+	// --- Port 67: PXE responses ---
 	//
 	// Strategy varies by client type:
 	//
 	//   iPXE clients:     Immediate proxy OFFER (iPXE handles ProxyDHCP correctly)
-	//   BIOS PXE ROM:     Delayed proxy OFFER (200ms, let router respond first)
-	//   UEFI PXE ROM:     NO proxy OFFER — many UEFI firmwares get confused by
-	//                     yiaddr=0 OFFERs and restart DISCOVER. Boot info
-	//                     delivered only via piggyback ACK on REQUEST.
+	//   BIOS PXE ROM:     Delayed proxy OFFER (200ms, yiaddr=0, let router give IP)
+	//   UEFI PXE ROM:     Full DHCP OFFER with real IP from our pool (.200-.219)
+	//                     UEFI firmware REQUIRES yiaddr != 0 in the OFFER.
+	//                     Once iPXE chainloads, it does its own DHCP with the router.
 	//
-	//   All REQUEST:      Piggyback ACK (client's IP from router + boot info)
+	//   BIOS REQUEST:     Piggyback ACK (client's IP from router + boot info)
+	//   UEFI REQUEST:     Full DHCP ACK (our assigned IP + boot info + network config)
 	//
-	isUEFI := strings.HasPrefix(arch, "UEFI")
+	// IMPORTANT: isUEFIPXE requires BOTH UEFI arch AND "PXEClient" vendor class.
+	// This prevents us from acting as DHCP server for WinPE (VC="MSFT 5.0"),
+	// other UEFI OS DHCP clients, etc. — only real PXE firmware gets pool IPs.
+	//
+	isUEFIPXE := strings.HasPrefix(arch, "UEFI") && !isIPXE && strings.HasPrefix(vcStr, "PXEClient")
 
 	switch msgType[0] {
 	case dhcpDiscover:
@@ -316,16 +346,18 @@ func (s *Server) handlePacket(data []byte, remoteAddr *net.UDPAddr, conn *net.UD
 			// and has a short OFFER collection window.
 			s.log.Info("DHCP", "Proxy OFFER for iPXE %s [%s] (immediate)", mac, arch)
 			s.sendBootResponse(dhcpOffer, data, xid, mac, arch, isIPXE, hasHTTP, nil, nil, nil)
-		} else if isUEFI {
-			// UEFI PXE ROM: do NOT send proxy OFFER.
-			// Many UEFI implementations treat yiaddr=0 OFFER as broken DHCP,
-			// restart DISCOVER, and never get an IP. Boot info will be
-			// delivered via piggyback ACK when we see the REQUEST.
-			s.log.Info("DHCP", "UEFI DISCOVER from %s — skipping OFFER (will piggyback on REQUEST)", mac)
+		} else if isUEFIPXE {
+			// UEFI PXE ROM: full DHCP OFFER with real IP from our pool.
+			// UEFI firmware requires yiaddr != 0 in the OFFER.
+			// We use our own server ID so there's no conflict with the router.
+			// On REQUEST, we always respond regardless of who was chosen.
+			assignedIP := s.uefiPoolAssign(mac)
+			s.log.Info("DHCP", "UEFI OFFER for %s: IP=%s + boot info", mac, assignedIP)
+			s.sendBootResponse(dhcpOffer, data, xid, mac, arch, isIPXE, hasHTTP, nil, nil, assignedIP)
 		} else {
 			// BIOS PXE ROM: delayed proxy OFFER.
 			// The 200ms delay lets the router's real OFFER arrive first.
-			// BIOS PXE ROMs need to see our OFFER to know PXE boot is available.
+			// BIOS PXE ROMs handle proxy mode (yiaddr=0) correctly.
 			dataCopy := make([]byte, len(data))
 			copy(dataCopy, data)
 			xidCopy := make([]byte, 4)
@@ -338,38 +370,98 @@ func (s *Server) handlePacket(data []byte, remoteAddr *net.UDPAddr, conn *net.UD
 		}
 
 	case dhcpRequest:
-		// Piggyback ACK for ALL clients: send our own ACK with boot info.
-		//   - yiaddr = same IP the router gives (no conflict)
-		//   - No option 54 (server ID) so PXE ROM won't reject it
-		//   - Boot info (siaddr, filename, opt66, opt67) gets delivered
-		//   - For UEFI clients this is the PRIMARY delivery of boot info
-		var reqIP net.IP
-		if rip, ok := options[optRequestedIP]; ok && len(rip) == 4 {
-			reqIP = net.IP(rip).To4()
-		}
-		if reqIP == nil || reqIP.Equal(net.IPv4zero) {
-			if ciaddr := net.IP(data[12:16]).To4(); !ciaddr.Equal(net.IPv4zero) {
-				reqIP = ciaddr
+		if assignedIP, hasLease := s.uefiLeases.Load(mac); hasLease {
+			// UEFI client we tracked from DISCOVER.
+			// Strategy: send TWO ACKs to cover both cases:
+			//  1) Full ACK with our pool IP (if firmware chose us)
+			//  2) Piggyback ACK with client's requested IP, NO opt54 (if firmware chose router)
+			ip := assignedIP.(net.IP)
+
+			// ACK #1: full DHCP with our pool IP + our server ID
+			s.log.Info("DHCP", "UEFI ACK #1 for %s: IP=%s (our pool)", mac, ip)
+			s.sendBootResponse(dhcpAck, data, xid, mac, arch, isIPXE, hasHTTP, nil, nil, ip)
+
+			// ACK #2: piggyback with client's requested IP, no opt54 (like BIOS)
+			var reqIP net.IP
+			if rip, ok := options[optRequestedIP]; ok && len(rip) == 4 {
+				reqIP = net.IP(rip).To4()
 			}
-		}
-		if reqIP != nil && !reqIP.Equal(net.IPv4zero) {
-			s.log.Info("DHCP", "Piggyback ACK for %s: IP=%s + boot info", mac, reqIP)
-			s.sendBootResponse(dhcpAck, data, xid, mac, arch, isIPXE, hasHTTP, nil, nil, reqIP)
+			if reqIP == nil || reqIP.Equal(net.IPv4zero) {
+				if ciaddr := net.IP(data[12:16]).To4(); !ciaddr.Equal(net.IPv4zero) {
+					reqIP = ciaddr
+				}
+			}
+			if reqIP != nil && !reqIP.Equal(net.IPv4zero) && !reqIP.Equal(ip) {
+				s.log.Info("DHCP", "UEFI ACK #2 for %s: IP=%s (piggyback, no opt54)", mac, reqIP)
+				s.sendBootResponse(dhcpAck, data, xid, mac, arch, false, hasHTTP, nil, nil, reqIP, true)
+			}
+			s.uefiLeases.Delete(mac)
 		} else {
-			s.log.Warn("DHCP", "REQUEST from %s but no IP found (opt50 and ciaddr both empty)", mac)
+			// BIOS/iPXE: Piggyback ACK with boot info.
+			//   - yiaddr = same IP the router gives (no conflict)
+			//   - No option 54 (server ID) so PXE ROM won't reject it
+			//   - Boot info (siaddr, filename, opt66, opt67) gets delivered
+			var reqIP net.IP
+			if rip, ok := options[optRequestedIP]; ok && len(rip) == 4 {
+				reqIP = net.IP(rip).To4()
+			}
+			if reqIP == nil || reqIP.Equal(net.IPv4zero) {
+				if ciaddr := net.IP(data[12:16]).To4(); !ciaddr.Equal(net.IPv4zero) {
+					reqIP = ciaddr
+				}
+			}
+			if reqIP != nil && !reqIP.Equal(net.IPv4zero) {
+				s.log.Info("DHCP", "Piggyback ACK for %s: IP=%s + boot info", mac, reqIP)
+				s.sendBootResponse(dhcpAck, data, xid, mac, arch, isIPXE, hasHTTP, nil, nil, reqIP)
+			} else {
+				s.log.Warn("DHCP", "REQUEST from %s but no IP found (opt50 and ciaddr both empty)", mac)
+			}
 		}
 	}
 }
 
-// sendBootResponse builds and sends a proxy PXE DHCP response.
+// uefiPoolAssign returns (or re-uses) an IP from the UEFI PXE pool for a MAC.
+func (s *Server) uefiPoolAssign(mac string) net.IP {
+	// Re-use existing lease
+	if ip, ok := s.uefiLeases.Load(mac); ok {
+		return ip.(net.IP)
+	}
+
+	s.mu.Lock()
+	idx := s.uefiNextIdx % uefiPoolSize
+	s.uefiNextIdx++
+	s.mu.Unlock()
+
+	ip := make(net.IP, 4)
+	copy(ip, s.serverIP.To4())
+	ip[3] = byte(uefiPoolStart + idx)
+
+	s.uefiLeases.Store(mac, ip)
+	s.log.Info("DHCP", "UEFI pool: assigned %s to %s (slot %d)", ip, mac, idx)
+	return ip
+}
+
+// sendBootResponse builds and sends a PXE DHCP response.
 //
-// Two modes:
-//   - Proxy OFFER (piggybackIP=nil): yiaddr=0, boot info only
-//   - Piggyback ACK (piggybackIP!=nil): yiaddr=client's IP from router,
+// Three modes:
+//   - Proxy OFFER (piggybackIP=nil): yiaddr=0, boot info only (BIOS)
+//   - UEFI full DHCP (piggybackIP=assigned IP from pool): yiaddr=real IP,
+//     boot info + full network config (subnet, gateway, DNS, lease).
+//   - BIOS piggyback ACK (piggybackIP=router's IP): yiaddr=client's IP,
 //     boot info included, option 54 OMITTED to avoid rejection.
-//
-// We NEVER assign IPs — the router handles that.
-func (s *Server) sendBootResponse(msgType byte, origData, xid []byte, mac, arch string, isIPXE, hasHTTP bool, viaCon *net.UDPConn, clientAddr *net.UDPAddr, piggybackIP net.IP) {
+func (s *Server) sendBootResponse(msgType byte, origData, xid []byte, mac, arch string, isIPXE, hasHTTP bool, viaCon *net.UDPConn, clientAddr *net.UDPAddr, piggybackIP net.IP, opts ...interface{}) {
+	// Parse optional parameters: bool → forceProxy, net.IP → serverIDOverride
+	forceProxy := false
+	var serverIDOverride net.IP
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case bool:
+			forceProxy = v
+		case net.IP:
+			serverIDOverride = v
+		}
+	}
+
 	response := make([]byte, 1024)
 
 	// --- BOOTP Header ---
@@ -384,11 +476,10 @@ func (s *Server) sendBootResponse(msgType byte, origData, xid []byte, mac, arch 
 	// ciaddr — copy from request
 	copy(response[12:16], origData[12:16])
 
-	// yiaddr — we never assign IPs
+	// yiaddr
 	if piggybackIP != nil {
-		// Piggyback: echo the IP the client got from the router
 		copy(response[16:20], piggybackIP.To4())
-		s.log.Info("DHCP", "  yiaddr=%s (piggyback from router) for %s", piggybackIP, mac)
+		s.log.Info("DHCP", "  yiaddr=%s for %s", piggybackIP, mac)
 	}
 	// else: proxy OFFER → yiaddr stays 0 (router assigns IP)
 
@@ -416,11 +507,22 @@ func (s *Server) sendBootResponse(msgType byte, origData, xid []byte, mac, arch 
 	offset += putOption(response[offset:], optMessageType, []byte{msgType})
 
 	// Option 54: Server Identifier
-	// OMIT in piggyback mode — including our IP as server ID when the
-	// client requested from the router causes some PXE ROMs to reject it.
-	if piggybackIP == nil {
+	isPiggyback := piggybackIP != nil
+	if serverIDOverride != nil {
+		// Spoof: use the router's server ID so UEFI firmware accepts our ACK
+		offset += putOption(response[offset:], optServerID, serverIDOverride.To4())
+		s.log.Info("DHCP", "  opt54=%s (spoofed router SID) for %s", serverIDOverride, mac)
+	} else if !isPiggyback {
+		// Proxy OFFER or full DHCP OFFER: always include our server ID
+		offset += putOption(response[offset:], optServerID, s.serverIP.To4())
+	} else if !forceProxy && strings.HasPrefix(arch, "UEFI") {
+		// UEFI full DHCP ACK (our pool IP): include our server ID
 		offset += putOption(response[offset:], optServerID, s.serverIP.To4())
 	}
+	// BIOS piggyback ACK: omit opt54 to avoid PXE ROM rejection
+
+	isUEFIArch := strings.HasPrefix(arch, "UEFI")
+	isUEFIFull := isUEFIArch && isPiggyback && !forceProxy
 
 	// Option 60: Vendor Class Identifier
 	offset += putOption(response[offset:], optVendorClass, []byte("PXEClient"))
@@ -437,7 +539,15 @@ func (s *Server) sendBootResponse(msgType byte, origData, xid []byte, mac, arch 
 	// Option 67: Boot Filename
 	offset += putOption(response[offset:], optBootfile, []byte(bootFile))
 
-	// No network config (subnet, gateway, DNS, lease) — router handles all of that
+	// Network config: only for UEFI full DHCP mode (we're acting as DHCP server).
+	// BIOS proxy mode: router handles all of this.
+	if isUEFIFull {
+		offset += putOption(response[offset:], optSubnetMask, s.subnetMask.To4())
+		offset += putOption(response[offset:], optRouter, s.gatewayIP.To4())
+		offset += putOption(response[offset:], optDNS, s.gatewayIP.To4()) // DNS = gateway (common default)
+		offset += putOption(response[offset:], optBroadcast, s.bcastIP.To4())
+		offset += putOption(response[offset:], optLeaseTime, []byte{0, 0, 0, 120}) // 120 seconds — just enough for PXE
+	}
 
 	// End option
 	response[offset] = optEnd
@@ -543,7 +653,7 @@ func (s *Server) getBootFilename(arch string, isIPXE, hasHTTP bool) string {
 		var file string
 		switch {
 		case strings.Contains(arch, "UEFI"):
-			file = "ipxe.efi"
+			file = "snp.efi"
 		default:
 			file = "undionly.kpxe"
 		}

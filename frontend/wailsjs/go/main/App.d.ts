@@ -6,7 +6,13 @@ import {netinfo} from '../models';
 import {logger} from '../models';
 import {orchestrator} from '../models';
 
+export function AssignISO(arg1:string,arg2:string):Promise<boolean>;
+
 export function BrowseISODirectory():Promise<string>;
+
+export function BrowseISOUnattend(arg1:string):Promise<string>;
+
+export function ClearISOUnattend(arg1:string):Promise<void>;
 
 export function GetBootProtocol():Promise<string>;
 
@@ -24,6 +30,8 @@ export function GetSelectedInterface():Promise<string>;
 
 export function GetServerStatus():Promise<orchestrator.ServiceStatus>;
 
+export function GetWinPERemote():Promise<boolean>;
+
 export function IsServerRunning():Promise<boolean>;
 
 export function ScanISOs():Promise<Array<isomgr.ISOInfo>>;
@@ -32,10 +40,16 @@ export function SetBootProtocol(arg1:string):Promise<void>;
 
 export function SetISODirectory(arg1:string):Promise<void>;
 
+export function SetISOUnattend(arg1:string,arg2:string):Promise<void>;
+
 export function SetNetworkInterface(arg1:string):Promise<void>;
+
+export function SetWinPERemote(arg1:boolean):Promise<void>;
 
 export function StartServer():Promise<void>;
 
 export function StopServer():Promise<void>;
 
 export function ToggleISO(arg1:string,arg2:boolean):Promise<void>;
+
+export function TriggerRemote(arg1:string):Promise<void>;

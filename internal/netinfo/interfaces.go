@@ -3,6 +3,8 @@ package netinfo
 import (
 	"fmt"
 	"net"
+	"os/exec"
+	"strings"
 )
 
 type NetInterface struct {
@@ -68,4 +70,26 @@ func GetInterfaceIP(name string) (string, error) {
 	}
 
 	return "", fmt.Errorf("no IPv4 address on interface %q", name)
+}
+
+// GetDefaultGateway detects the system's default IPv4 gateway.
+// Falls back to serverIP's .1 if detection fails.
+func GetDefaultGateway(serverIP string) string {
+	// Try PowerShell (Windows 10+)
+	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+		"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop",
+	).Output()
+	if err == nil {
+		gw := strings.TrimSpace(string(out))
+		if ip := net.ParseIP(gw); ip != nil && ip.To4() != nil {
+			return gw
+		}
+	}
+
+	// Fallback: .1 in the server's subnet
+	sip := net.ParseIP(serverIP).To4()
+	if sip != nil {
+		return fmt.Sprintf("%d.%d.%d.1", sip[0], sip[1], sip[2])
+	}
+	return "0.0.0.0"
 }

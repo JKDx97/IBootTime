@@ -4,6 +4,7 @@ import Dashboard from './components/Dashboard'
 import IsoManager from './components/IsoManager'
 import ClientMonitor from './components/ClientMonitor'
 import NetworkConfig from './components/NetworkConfig'
+import RemoteControl from './components/RemoteControl'
 
 function App() {
   const [activeView, setActiveView] = useState('dashboard')
@@ -18,6 +19,8 @@ function App() {
         return <ClientMonitor />
       case 'config':
         return <NetworkConfig />
+      case 'remote':
+        return <RemoteControl />
       default:
         return <Dashboard />
     }

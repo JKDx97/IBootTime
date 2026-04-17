@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Network, Save, FolderOpen, Cpu, Terminal, Layers, Wifi } from 'lucide-react'
+import { Network, Save, FolderOpen, Cpu, Terminal, Layers, Wifi, ScreenShare } from 'lucide-react'
 import {
   GetNetworkInterfaces,
   GetSelectedInterface,
@@ -8,6 +8,8 @@ import {
   BrowseISODirectory,
   GetBootProtocol,
   SetBootProtocol,
+  GetWinPERemote,
+  SetWinPERemote,
 } from '../../wailsjs/go/main/App'
 import clsx from 'clsx'
 
@@ -64,6 +66,7 @@ export default function NetworkConfig() {
   const [selectedIface, setSelectedIface] = useState('')
   const [isoDir, setIsoDir] = useState('')
   const [bootProtocol, setBootProtocol] = useState('ipxe')
+  const [winpeRemote, setWinpeRemote] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
 
@@ -73,11 +76,13 @@ export default function NetworkConfig() {
       GetSelectedInterface(),
       GetISODirectory(),
       GetBootProtocol(),
-    ]).then(([ifaces, iface, dir, proto]) => {
+      GetWinPERemote(),
+    ]).then(([ifaces, iface, dir, proto, remote]) => {
       setInterfaces(ifaces || [])
       setSelectedIface(iface)
       setIsoDir(dir)
       setBootProtocol(proto)
+      setWinpeRemote(!!remote)
     })
   }, [])
 
@@ -87,6 +92,7 @@ export default function NetworkConfig() {
     try {
       await SetNetworkInterface(selectedIface)
       await SetBootProtocol(bootProtocol)
+      await SetWinPERemote(winpeRemote)
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } catch (e) {
@@ -237,6 +243,47 @@ export default function NetworkConfig() {
             </div>
           </div>
         </div>
+      </div>
+
+      {/* ====== REMOTE WINPE ====== */}
+      <div className="bg-slate-900 rounded-2xl border border-slate-700 p-5 space-y-4">
+        <div className="flex items-center gap-2 mb-1">
+          <ScreenShare size={18} className="text-emerald-400" />
+          <h3 className="text-sm font-semibold text-white">Control Remoto (WinPE)</h3>
+          <span className="ml-auto text-xs text-slate-500">VNC durante la instalación</span>
+        </div>
+
+        <div className="flex items-center justify-between">
+          <div className="space-y-1">
+            <p className="text-sm text-slate-300">Habilitar control remoto en WinPE</p>
+            <p className="text-xs text-slate-500">
+              Inyecta un servidor VNC en el boot.wim para controlar el instalador remotamente vía noVNC.
+              Requiere colocar UltraVNC portable en <code className="bg-slate-800 px-1 rounded">remote/winvnc/</code>
+            </p>
+          </div>
+          <button
+            onClick={() => setWinpeRemote(!winpeRemote)}
+            className={clsx(
+              'relative w-12 h-6 rounded-full transition-colors shrink-0 ml-4',
+              winpeRemote ? 'bg-emerald-500' : 'bg-slate-600'
+            )}
+          >
+            <span className={clsx(
+              'absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform',
+              winpeRemote ? 'translate-x-6' : 'translate-x-0.5'
+            )} />
+          </button>
+        </div>
+
+        {winpeRemote && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg border bg-amber-500/10 border-amber-500/30">
+            <p className="text-xs text-amber-400">
+              <strong>Nota:</strong> Al habilitar esta opción, la caché de boot.wim se reconstruirá la próxima vez que inicie el servidor.
+              Asegúrate de tener <code className="bg-slate-800 px-1 rounded">winvnc.exe</code> en la carpeta <code className="bg-slate-800 px-1 rounded">remote/winvnc/</code>.
+              La contraseña VNC se genera automáticamente por sesión.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* ====== SAVE ====== */}

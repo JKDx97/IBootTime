@@ -11,17 +11,32 @@ import (
 )
 
 type Manager struct {
-	mu       sync.RWMutex
-	isoDir   string
-	isos     map[string]*ISOInfo
-	enabled  map[string]bool
+	mu           sync.RWMutex
+	isoDir       string
+	isos         map[string]*ISOInfo
+	enabled      map[string]bool
+	disabledList []string
+	unattend     map[string]string // ISO name -> autounattend.xml path
 }
 
 func NewManager(isoDir string) *Manager {
 	return &Manager{
-		isoDir:  isoDir,
-		isos:    make(map[string]*ISOInfo),
-		enabled: make(map[string]bool),
+		isoDir:   isoDir,
+		isos:     make(map[string]*ISOInfo),
+		enabled:  make(map[string]bool),
+		unattend: make(map[string]string),
+	}
+}
+
+func (m *Manager) SetDisabledNames(names []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.disabledList = names
+	for _, name := range names {
+		m.enabled[name] = false
+		if iso, ok := m.isos[name]; ok {
+			iso.Enabled = false
+		}
 	}
 }
 
@@ -73,7 +88,19 @@ func (m *Manager) Scan() ([]ISOInfo, error) {
 		if prev, ok := m.enabled[name]; ok {
 			iso.Enabled = prev
 		} else {
-			iso.Enabled = true
+			// Check if in disabled list from config
+			disabled := false
+			for _, d := range m.disabledList {
+				if d == name {
+					disabled = true
+					break
+				}
+			}
+			iso.Enabled = !disabled
+		}
+
+		if upath, ok := m.unattend[name]; ok {
+			iso.UnattendPath = upath
 		}
 
 		newISOs[name] = iso
@@ -124,6 +151,48 @@ func (m *Manager) Toggle(name string, enabled bool) error {
 	iso.Enabled = enabled
 	m.enabled[name] = enabled
 	return nil
+}
+
+func (m *Manager) ListDisabledNames() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var disabled []string
+	for name, iso := range m.isos {
+		if !iso.Enabled {
+			disabled = append(disabled, name)
+		}
+	}
+	return disabled
+}
+
+func (m *Manager) SetUnattendPaths(paths map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unattend = paths
+	for name, path := range paths {
+		if iso, ok := m.isos[name]; ok {
+			iso.UnattendPath = path
+		}
+	}
+}
+
+func (m *Manager) SetUnattend(name, path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if path == "" {
+		delete(m.unattend, name)
+	} else {
+		m.unattend[name] = path
+	}
+	if iso, ok := m.isos[name]; ok {
+		iso.UnattendPath = path
+	}
+}
+
+func (m *Manager) GetUnattend(name string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.unattend[name]
 }
 
 func (m *Manager) GetByName(name string) (*ISOInfo, error) {

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Disc3, FolderOpen, RefreshCw, ToggleLeft, ToggleRight } from 'lucide-react'
-import { GetISOList, ScanISOs, ToggleISO, GetISODirectory, BrowseISODirectory } from '../../wailsjs/go/main/App'
+import { Disc3, FolderOpen, RefreshCw, ToggleLeft, ToggleRight, FileText, X } from 'lucide-react'
+import { GetISOList, ScanISOs, ToggleISO, GetISODirectory, BrowseISODirectory, BrowseISOUnattend, ClearISOUnattend } from '../../wailsjs/go/main/App'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import clsx from 'clsx'
 
@@ -58,6 +58,22 @@ export default function IsoManager() {
     }
   }
 
+  const handleBrowseUnattend = async (name) => {
+    try {
+      await BrowseISOUnattend(name)
+    } catch (e) {
+      console.error('Browse unattend error:', e)
+    }
+  }
+
+  const handleClearUnattend = async (name) => {
+    try {
+      await ClearISOUnattend(name)
+    } catch (e) {
+      console.error('Clear unattend error:', e)
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -98,13 +114,14 @@ export default function IsoManager() {
               <th className="text-left px-4 py-3">Size</th>
               <th className="text-left px-4 py-3">Type</th>
               <th className="text-left px-4 py-3">Arch</th>
+              <th className="text-left px-4 py-3">Unattend</th>
               <th className="text-center px-4 py-3">Enabled</th>
             </tr>
           </thead>
           <tbody>
             {isos.length === 0 ? (
               <tr>
-                <td colSpan={5} className="text-center py-12 text-slate-500">
+                <td colSpan={6} className="text-center py-12 text-slate-500">
                   <Disc3 size={32} className="mx-auto mb-2 opacity-50" />
                   <p>No ISO files found</p>
                   <p className="text-xs mt-1">Configure a directory and scan for ISOs</p>
@@ -129,6 +146,35 @@ export default function IsoManager() {
                     </span>
                   </td>
                   <td className="px-4 py-3 text-sm text-slate-400">{iso.arch}</td>
+                  <td className="px-4 py-3">
+                    {(iso.osType === 'Windows' || iso.osType === 'WinPE') ? (
+                      iso.unattendPath ? (
+                        <div className="flex items-center gap-1">
+                          <FileText size={14} className="text-emerald-400 flex-shrink-0" />
+                          <span className="text-xs text-emerald-400 truncate max-w-[120px]" title={iso.unattendPath}>
+                            {iso.unattendPath.split('\\').pop().split('/').pop()}
+                          </span>
+                          <button
+                            onClick={() => handleClearUnattend(iso.name)}
+                            className="ml-1 p-0.5 hover:bg-red-500/20 rounded text-red-400"
+                            title="Quitar autounattend.xml"
+                          >
+                            <X size={12} />
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => handleBrowseUnattend(iso.name)}
+                          className="flex items-center gap-1 px-2 py-1 text-xs bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded text-slate-400 hover:text-white transition-colors"
+                        >
+                          <FileText size={12} />
+                          Agregar
+                        </button>
+                      )
+                    ) : (
+                      <span className="text-xs text-slate-600">N/A</span>
+                    )}
+                  </td>
                   <td className="px-4 py-3 text-center">
                     <button
                       onClick={() => handleToggle(iso.name, iso.enabled)}

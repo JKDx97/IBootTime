@@ -57,8 +57,10 @@ func (a *App) startup(ctx context.Context) {
 		wailsRuntime.EventsEmit(a.ctx, "client:updated", s)
 	})
 
-	// Initialize ISO manager
+	// Initialize ISO manager with persisted disabled list and unattend paths
 	a.isoMgr = isomgr.NewManager(a.cfg.GetISODirectory())
+	a.isoMgr.SetDisabledNames(a.cfg.GetDisabledISOs())
+	a.isoMgr.SetUnattendPaths(a.cfg.GetAllISOUnattend())
 
 	// Initialize orchestrator
 	a.orchestrator = orchestrator.New(
@@ -179,6 +181,11 @@ func (a *App) ToggleISO(name string, enabled bool) error {
 	if err != nil {
 		return err
 	}
+	// Persist disabled ISOs to config
+	disabled := a.isoMgr.ListDisabledNames()
+	a.cfg.Update(func(c *config.Config) {
+		c.DisabledISOs = disabled
+	})
 	wailsRuntime.EventsEmit(a.ctx, "iso:list-changed", a.isoMgr.List())
 	return nil
 }
@@ -189,10 +196,34 @@ func (a *App) GetConnectedClients() []session.ClientSession {
 	return a.sessions.List()
 }
 
+func (a *App) AssignISO(mac, isoName string) bool {
+	a.log.Info("App", "Assigning ISO '%s' to client %s", isoName, mac)
+	return a.sessions.AssignISO(mac, isoName)
+}
+
 // ==================== Logs ====================
 
 func (a *App) GetRecentLogs(count int) []logger.LogEntry {
 	return a.log.GetEntries(count)
+}
+
+// ==================== WinPE Remote Control ====================
+
+func (a *App) GetWinPERemote() bool {
+	return a.cfg.GetWinPERemote()
+}
+
+func (a *App) SetWinPERemote(enabled bool) error {
+	return a.cfg.Update(func(c *config.Config) {
+		c.WinPERemote = enabled
+	})
+}
+
+// TriggerRemote tells the given WinPE client to initiate a reverse VNC
+// connection. The client polls /api/winpe/vnc-check and connects only when
+// this trigger is set.
+func (a *App) TriggerRemote(ip string) error {
+	return a.orchestrator.TriggerRemote(ip)
 }
 
 // ==================== Boot Protocol ====================
@@ -212,6 +243,55 @@ func (a *App) SetBootProtocol(protocol string) error {
 	return a.cfg.Update(func(c *config.Config) {
 		c.BootProtocol = p
 	})
+}
+
+// ==================== Autounattend ====================
+
+func (a *App) SetISOUnattend(isoName, filePath string) error {
+	if _, err := os.Stat(filePath); err != nil {
+		return fmt.Errorf("file not found: %s", filePath)
+	}
+	a.isoMgr.SetUnattend(isoName, filePath)
+	a.cfg.Update(func(c *config.Config) {
+		if c.ISOUnattend == nil {
+			c.ISOUnattend = make(map[string]string)
+		}
+		c.ISOUnattend[isoName] = filePath
+	})
+	a.log.Info("App", "Set autounattend.xml for %s: %s", isoName, filePath)
+	wailsRuntime.EventsEmit(a.ctx, "iso:list-changed", a.isoMgr.List())
+	return nil
+}
+
+func (a *App) ClearISOUnattend(isoName string) error {
+	a.isoMgr.SetUnattend(isoName, "")
+	a.cfg.Update(func(c *config.Config) {
+		if c.ISOUnattend != nil {
+			delete(c.ISOUnattend, isoName)
+		}
+	})
+	a.log.Info("App", "Cleared autounattend.xml for %s", isoName)
+	wailsRuntime.EventsEmit(a.ctx, "iso:list-changed", a.isoMgr.List())
+	return nil
+}
+
+func (a *App) BrowseISOUnattend(isoName string) (string, error) {
+	filePath, err := wailsRuntime.OpenFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select autounattend.xml for " + isoName,
+		Filters: []wailsRuntime.FileFilter{
+			{DisplayName: "XML Files (*.xml)", Pattern: "*.xml"},
+			{DisplayName: "All Files (*.*)", Pattern: "*.*"},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	if filePath != "" {
+		if err := a.SetISOUnattend(isoName, filePath); err != nil {
+			return "", err
+		}
+	}
+	return filePath, nil
 }
 
 

@@ -106,6 +106,8 @@ func (s *Server) readHandler(filename string, rf io.ReaderFrom) error {
 	case "grub.cfg", "grub/grub.cfg":
 		return s.serveGRUBConfig(rf)
 	case "boot.ipxe", "autoboot.ipxe":
+		// Update client state to menu when they request the boot script
+		s.sessions.UpdateStateByIP(clientIP, session.StateMenu)
 		return s.serveIPXEScript(rf)
 	default:
 		s.log.Warn("TFTP", "File not found: %s (from %s)", filename, clientIP)
@@ -229,7 +231,11 @@ func (s *Server) serveIPXEScript(rf io.ReaderFrom) error {
 	script.WriteString(fmt.Sprintf("set server-ip %s\n", s.serverIP))
 	script.WriteString(fmt.Sprintf("set http-root http://${server-ip}:%d\n\n", s.httpPort))
 
-	// Menu
+	// Try HTTP chain first — enables remote ISO assignment + polling + session tracking.
+	// Falls back to inline TFTP menu if client has no HTTP (e.g. VirtualBox built-in iPXE).
+	script.WriteString("chain ${http-root}/boot.ipxe?mac=${net0/mac:hexhyp}&arch=${buildarch} || goto start\n\n")
+
+	// Menu (TFTP fallback)
 	script.WriteString(":start\n")
 	script.WriteString("menu IBootTime - Network Boot Server [${server-ip}]\n")
 	script.WriteString("item --gap --             ========================================\n")

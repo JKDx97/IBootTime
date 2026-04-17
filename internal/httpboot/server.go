@@ -9,14 +9,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"IBootTime/internal/config"
+	"IBootTime/internal/hidecmd"
 	"IBootTime/internal/isomgr"
 	"IBootTime/internal/logger"
 	"IBootTime/internal/session"
@@ -44,6 +45,21 @@ type Server struct {
 	winPrepResults sync.Map
 	// Drive letter assigned to each Windows ISO: isoPath -> driveLetter (string, e.g. "Z")
 	winDriveLetters sync.Map
+
+	onPrepProgress func(phase string, current, total int, detail string)
+	onPrepDone     func()
+
+	// Reverse VNC listener: WinPE clients dial in to us, bypassing their
+	// local firewall. Nil until Start() completes.
+	reverseVNC *ReverseVNCListener
+}
+
+func (s *Server) SetPrepProgressCallback(fn func(phase string, current, total int, detail string)) {
+	s.onPrepProgress = fn
+}
+
+func (s *Server) SetPrepDoneCallback(fn func()) {
+	s.onPrepDone = fn
 }
 
 func New(port int, serverIP string, isoMgr *isomgr.Manager, log *logger.Logger, sessions *session.Manager, cfg *config.Config) *Server {
@@ -64,6 +80,29 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/wimboot", s.handleWimboot)
 	mux.HandleFunc("/iso/", s.handleISOFile)
 	mux.HandleFunc("/health", s.handleHealth)
+	// VNC remote control endpoints
+	mux.HandleFunc("/api/winpe/remote-ready", s.handleRemoteBeacon)
+	mux.HandleFunc("/api/winpe/vnc-config", s.handleVNCConfig)
+	mux.HandleFunc("/api/winpe/vnc-ini", s.handleVNCIni)
+	mux.HandleFunc("/api/winpe/vnc-password", s.handleVNCPassword)
+	mux.HandleFunc("/ws/vnc", s.handleVNCProxy)
+	mux.HandleFunc("/novnc", s.handleNoVNC)
+	mux.HandleFunc("/api/winpe/vnc-check", s.handleVNCCheck)
+	mux.HandleFunc("/api/remote/trigger", s.handleRemoteTrigger)
+	// VNC post-install endpoints (for Windows OOBE persistence)
+	mux.HandleFunc("/api/vnc/files/", s.handleVNCFileDownload)
+	mux.HandleFunc("/api/vnc/setup-script", s.handleVNCSetupScript)
+	mux.HandleFunc("/api/vnc/unattend", s.handleUnattend)
+	// Per-ISO autounattend.xml endpoint
+	mux.HandleFunc("/api/iso-unattend", s.handleISOUnattend)
+	// Serve noVNC static files locally (no CDN needed)
+	noVNCDir := s.findNoVNCDir()
+	if noVNCDir != "" {
+		s.log.Info("HTTP", "Serving noVNC static files from %s", noVNCDir)
+		mux.Handle("/novnc-static/", http.StripPrefix("/novnc-static/", http.FileServer(http.Dir(noVNCDir))))
+	} else {
+		s.log.Warn("HTTP", "noVNC-master directory not found — remote viewer won't work")
+	}
 
 	addr := fmt.Sprintf(":%d", s.port)
 
@@ -83,6 +122,13 @@ func (s *Server) Start(ctx context.Context) error {
 			s.log.Error("HTTP", "Server error: %v", err)
 		}
 	}()
+
+	// Start reverse VNC listener so WinPE clients can dial in to us.
+	s.reverseVNC = NewReverseVNCListener(DefaultReverseVNCPort, s.log, s.sessions)
+	if err := s.reverseVNC.Start(ctx); err != nil {
+		s.log.Warn("VNC", "Reverse VNC listener not available: %v", err)
+		s.reverseVNC = nil
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -105,6 +151,10 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) Stop() {
+	if s.reverseVNC != nil {
+		s.reverseVNC.Stop()
+		s.reverseVNC = nil
+	}
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -116,36 +166,49 @@ func (s *Server) Stop() {
 }
 
 // cleanupSMBShares removes all SMB shares created for Windows ISO installation.
+// Batches all removals into a single PowerShell call.
 func (s *Server) cleanupSMBShares() {
+	var names []string
 	s.smbShares.Range(func(key, value interface{}) bool {
-		shareName := key.(string)
-		s.log.Info("HTTP", "Removing SMB share: %s", shareName)
-		exec.Command("powershell", "-NoProfile", "-Command",
-			fmt.Sprintf("Remove-SmbShare -Name '%s' -Force -ErrorAction SilentlyContinue", shareName)).Run()
+		names = append(names, key.(string))
 		s.smbShares.Delete(key)
 		return true
 	})
+	if len(names) == 0 {
+		return
+	}
+	var sb strings.Builder
+	for _, n := range names {
+		sb.WriteString(fmt.Sprintf("Remove-SmbShare -Name '%s' -Force -ErrorAction SilentlyContinue; ", n))
+	}
+	hidecmd.Command("powershell", "-NoProfile", "-Command", sb.String()).Run()
+	s.log.Info("HTTP", "Removed %d SMB shares", len(names))
 }
 
 const smbUser = "Administrador"
 const smbPass = "P0s31d0n"
-const cacheVersion = "v11-serial-dism"
+const cacheVersion = "v28-bare-setup"
+
+// safeNetDriveLetters lists drive letters safe for net use in WinPE.
+// Avoids: A/B (floppy), C (system), D (common CD/HDD), E (common),
+// X (WinPE RAM disk), and keeps commonly used letters free.
+var safeNetDriveLetters = []string{
+	"Z", "Y", "W", "V", "U", "T", "S", "R", "Q", "P", "O", "N", "M", "L", "K", "J", "I", "H", "G", "F",
+}
 
 // preloadBootWimCache scans disk for previously cached boot.wim files and
 // populates in-memory maps so modified boot.wim is served instantly on startup.
 func (s *Server) preloadBootWimCache() {
 	isos := s.isoMgr.ListEnabled()
-	nextLetter := byte('Z')
+	letterIdx := 0
 	for _, iso := range isos {
 		if iso.OSType != isomgr.OSTypeWindows && iso.OSType != isomgr.OSTypeWinPE {
 			continue
 		}
-		// Assign drive letter
-		letter := string(nextLetter)
+		// Assign safe drive letter
+		letter := safeNetDriveLetters[letterIdx%len(safeNetDriveLetters)]
 		s.winDriveLetters.Store(iso.Path, letter)
-		if nextLetter > 'N' {
-			nextLetter--
-		}
+		letterIdx++
 
 		// Check if valid cached boot.wim exists on disk
 		cacheID := sanitizeMenuID(iso.Name)
@@ -167,45 +230,106 @@ func (s *Server) preloadBootWimCache() {
 }
 
 // shareAllISOs mounts ALL enabled ISOs and creates SMB shares immediately.
-// This is fast (~5s per ISO) and runs at server start.
 func (s *Server) shareAllISOs() {
 	s.log.Info("HTTP", "=== Creating SMB shares for all ISOs ===")
 
 	isos := s.isoMgr.ListEnabled()
+	total := len(isos)
+
+	// Phase 1: Mount all ISOs IN PARALLEL and collect share info
+	type shareInfo struct {
+		name        string
+		driveLetter string
+		isoName     string
+		isoPath     string
+	}
+
+	type mountResult struct {
+		info shareInfo
+		err  error
+	}
+
+	if s.onPrepProgress != nil {
+		s.onPrepProgress("mounting", 0, total*2, fmt.Sprintf("Montando %d ISOs en paralelo...", total))
+	}
+
+	results := make(chan mountResult, total)
 	for _, iso := range isos {
-		shareName := "IB_" + sanitizeMenuID(iso.Name)
+		go func(iso isomgr.ISOInfo) {
+			shareName := "IB_" + sanitizeMenuID(iso.Name)
+			// Check if share already exists
+			if _, exists := s.smbShares.Load(shareName); exists {
+				results <- mountResult{info: shareInfo{name: shareName, isoName: iso.Name, isoPath: iso.Path}, err: fmt.Errorf("already exists")}
+				return
+			}
+			driveLetter, err := s.mountISO(iso.Path)
+			if err != nil {
+				results <- mountResult{err: fmt.Errorf("mount %s: %w", iso.Name, err)}
+				return
+			}
+			results <- mountResult{info: shareInfo{shareName, driveLetter, iso.Name, iso.Path}}
+		}(iso)
+	}
 
-		// Check if share already exists
-		if _, exists := s.smbShares.Load(shareName); exists {
+	var pending []shareInfo
+	for i := 0; i < total; i++ {
+		r := <-results
+		if r.err != nil {
+			if !strings.Contains(r.err.Error(), "already exists") {
+				s.log.Warn("HTTP", "ISO mount: %v", r.err)
+			}
 			continue
 		}
-
-		// Mount the ISO
-		driveLetter, err := s.mountISO(iso.Path)
-		if err != nil {
-			s.log.Warn("HTTP", "Could not mount %s: %v", iso.Name, err)
-			continue
-		}
-
-		// Remove existing share (idempotent)
-		exec.Command("powershell", "-NoProfile", "-Command",
-			fmt.Sprintf("Remove-SmbShare -Name '%s' -Force -ErrorAction SilentlyContinue", shareName)).Run()
-
-		// Create share with FullAccess for Everyone (visible in network + accessible)
-		smbCmd := exec.Command("powershell", "-NoProfile", "-Command",
-			fmt.Sprintf(
-				"$sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0'); "+
-					"$everyone = $sid.Translate([System.Security.Principal.NTAccount]).Value; "+
-					"New-SmbShare -Name '%s' -Path '%s:\\' -FullAccess $everyone",
-				shareName, driveLetter))
-		if out, err := smbCmd.CombinedOutput(); err != nil {
-			s.log.Warn("HTTP", "SMB share failed for %s: %s", iso.Name, strings.TrimSpace(string(out)))
-		} else {
-			s.smbShares.Store(shareName, iso.Path)
-			s.log.Info("HTTP", "SMB share: \\\\%s\\%s -> %s:\\ (%s)", s.serverIP, shareName, driveLetter, iso.Name)
+		pending = append(pending, r.info)
+		if s.onPrepProgress != nil {
+			s.onPrepProgress("mounting", len(pending), total*2, fmt.Sprintf("Montada %s", r.info.isoName))
 		}
 	}
-	s.log.Info("HTTP", "=== All %d SMB shares created ===", s.countShares())
+
+	if len(pending) == 0 {
+		s.log.Info("HTTP", "=== All shares already exist ===")
+		return
+	}
+
+	// Phase 2: Create ALL SMB shares in ONE PowerShell call
+	var sb strings.Builder
+	sb.WriteString("$sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0'); ")
+	sb.WriteString("$everyone = $sid.Translate([System.Security.Principal.NTAccount]).Value; ")
+	for _, si := range pending {
+		sb.WriteString(fmt.Sprintf(
+			"Remove-SmbShare -Name '%s' -Force -ErrorAction SilentlyContinue; ", si.name))
+		sb.WriteString(fmt.Sprintf(
+			"New-SmbShare -Name '%s' -Path '%s:\\' -FullAccess $everyone,'%s' -ErrorAction SilentlyContinue; ",
+			si.name, si.driveLetter, smbUser))
+	}
+
+	if out, err := hidecmd.Command("powershell", "-NoProfile", "-Command", sb.String()).CombinedOutput(); err != nil {
+		s.log.Warn("HTTP", "SMB batch share creation had errors: %s", strings.TrimSpace(string(out)))
+	}
+
+	// Verify which shares were created with ONE PowerShell call
+	var verifyParts []string
+	for _, si := range pending {
+		verifyParts = append(verifyParts, fmt.Sprintf("'%s'", si.name))
+	}
+	verifyCmd := hidecmd.Command("powershell", "-NoProfile", "-Command",
+		fmt.Sprintf("Get-SmbShare -Name %s -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }",
+			strings.Join(verifyParts, ",")))
+	verifyOut, _ := verifyCmd.Output()
+	existingShares := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(string(verifyOut)), "\n") {
+		existingShares[strings.TrimSpace(line)] = true
+	}
+
+	for _, si := range pending {
+		if existingShares[si.name] {
+			s.smbShares.Store(si.name, si.isoPath)
+			s.log.Info("HTTP", "SMB share: \\\\%s\\%s -> %s:\\ (%s)", s.serverIP, si.name, si.driveLetter, si.isoName)
+		} else {
+			s.log.Warn("HTTP", "SMB share not created for %s", si.isoName)
+		}
+	}
+	s.log.Info("HTTP", "=== %d SMB shares created ===", s.countShares())
 }
 
 func (s *Server) countShares() int {
@@ -218,16 +342,20 @@ func (s *Server) countShares() int {
 // Runs in background after shares are created.
 func (s *Server) prepareWindowsBootWims() {
 	isos := s.isoMgr.ListEnabled()
-	nextLetter := byte('Z')
+	totalISOs := len(isos)
+	letterIdx := 0
+	// Count Windows ISOs for progress
+	winIdx := 0
 	// DISM operations MUST run sequentially — concurrent WIM mounts cause failures
 	for _, iso := range isos {
 		if iso.OSType != isomgr.OSTypeWindows && iso.OSType != isomgr.OSTypeWinPE {
 			continue
 		}
-		letter := string(nextLetter)
+		letter := safeNetDriveLetters[letterIdx%len(safeNetDriveLetters)]
 		s.winDriveLetters.Store(iso.Path, letter)
-		if nextLetter > 'N' {
-			nextLetter--
+		letterIdx++
+		if s.onPrepProgress != nil {
+			s.onPrepProgress("preparing", totalISOs+winIdx, totalISOs*2, fmt.Sprintf("Preparando %s (DISM)...", iso.Name))
 		}
 		shareName, err := s.prepareWindowsInstall(&iso, letter)
 		if err != nil {
@@ -237,8 +365,12 @@ func (s *Server) prepareWindowsBootWims() {
 			s.winPrepResults.Store(iso.Path, shareName)
 			s.log.Info("HTTP", "DISM prep complete for %s (share: %s, drive: %s:)", iso.Name, shareName, letter)
 		}
+		winIdx++
 	}
 	s.log.Info("HTTP", "All Windows boot.wim preparations finished")
+	if s.onPrepDone != nil {
+		s.onPrepDone()
+	}
 }
 
 // prepareWindowsInstall mounts a Windows ISO, creates an SMB share, and
@@ -295,7 +427,7 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 	// Version marker — if injection logic changes, bump this to force rebuild
 	versionFile := filepath.Join(cacheDir, ".version")
 	if versionData, err := os.ReadFile(versionFile); err == nil && string(versionData) == cacheVersion {
-		needRebuild = needRebuild // keep existing decision
+		// version matches — keep existing rebuild decision
 	} else {
 		needRebuild = true // version mismatch or missing, force rebuild
 	}
@@ -313,10 +445,10 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 		}
 
 		// Remove read-only attribute (ISO files are read-only)
-		exec.Command("attrib", "-r", cachedWim).Run()
+		hidecmd.Command("attrib", "-r", cachedWim).Run()
 
 		// Get WIM info to see available indexes
-		wimInfoCmd := exec.Command("dism", "/get-wiminfo", "/wimfile:"+cachedWim)
+		wimInfoCmd := hidecmd.Command("dism", "/get-wiminfo", "/wimfile:"+cachedWim)
 		wimInfoOut, _ := wimInfoCmd.CombinedOutput()
 		wimInfoStr := string(wimInfoOut)
 		s.log.Info("HTTP", "WIM info for %s:\n%s", iso.Name, wimInfoStr)
@@ -339,19 +471,22 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 		s.log.Info("HTTP", "Detected %d WIM index(es) in boot.wim", maxIndex)
 
 		shareName := "IB_" + cacheID
+		_ = url.QueryEscape(iso.Name) // encodedISOName — used when autounattend is re-enabled
 
-		// Modify each index: inject startnet.cmd + winpeshl.ini
-		// Index 2 (Windows Setup) is what the BCD boots — CRITICAL to modify
-		// Index 1 (WinPE) is fallback
-		for idx := maxIndex; idx >= 1; idx-- {
+		// Only modify the highest index (Index 2 = Windows Setup, which BCD boots)
+		// Index 1 (plain WinPE) is a rarely-used fallback — skip to halve DISM time
+		for idx := maxIndex; idx >= maxIndex; idx-- {
 			idxMountDir := filepath.Join(cacheDir, fmt.Sprintf("mount_%d", idx))
 			os.MkdirAll(idxMountDir, 0755)
 
-			// Clean any stale mount
-			exec.Command("dism", "/unmount-wim", "/mountdir:"+idxMountDir, "/discard").Run()
+			// Clean stale mount ONLY if directory has contents (avoids slow unnecessary DISM call)
+			if entries, err := os.ReadDir(idxMountDir); err == nil && len(entries) > 0 {
+				s.log.Info("HTTP", "DISM: cleaning stale mount at %s...", idxMountDir)
+				hidecmd.Command("dism", "/unmount-wim", "/mountdir:"+idxMountDir, "/discard").Run()
+			}
 
 			s.log.Info("HTTP", "DISM: mounting boot.wim index %d...", idx)
-			dismMount := exec.Command("dism", "/mount-wim",
+			dismMount := hidecmd.Command("dism", "/mount-wim",
 				"/wimfile:"+cachedWim, fmt.Sprintf("/index:%d", idx), "/mountdir:"+idxMountDir)
 			if out, err := dismMount.CombinedOutput(); err != nil {
 				s.log.Warn("HTTP", "DISM mount index %d failed (may not exist): %v\n%s", idx, err, string(out))
@@ -362,7 +497,7 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 			// -- Inject NIC drivers (critical for Win11 WinPE networking) --
 			if driverDir := s.findDriversDir(); driverDir != "" {
 				s.log.Info("HTTP", "DISM: injecting drivers from %s into index %d...", driverDir, idx)
-				dismDriver := exec.Command("dism", "/image:"+idxMountDir,
+				dismDriver := hidecmd.Command("dism", "/image:"+idxMountDir,
 					"/add-driver", "/driver:"+driverDir, "/recurse", "/forceunsigned")
 				if out, err := dismDriver.CombinedOutput(); err != nil {
 					s.log.Warn("HTTP", "Driver injection index %d (non-fatal): %v\n%s", idx, err, strings.TrimSpace(string(out)))
@@ -377,55 +512,77 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 
 			if idx >= 2 {
 				// Index 2+ (Windows Setup): wpeinit handled by winpeshl.ini.
-				// startnet.cmd: force network init, wait for network, map drive via IP with user/pass, launch setup.
+				// startnet.cmd: network init, wait for server, try multiple auth methods, launch setup.
 				startnetContent = fmt.Sprintf("@echo off\r\n"+
 					"echo [IBootTime] Inicializando red...\r\n"+
 					"wpeutil initializenetwork >nul 2>&1\r\n"+
 					"wpeutil waitfornetwork >nul 2>&1\r\n"+
+					"wpeutil DisableFirewall >nul 2>&1\r\n"+
 					"ping -n 3 127.0.0.1 >nul\r\n"+
 					"ipconfig /renew >nul 2>&1\r\n"+
 					"ping -n 2 127.0.0.1 >nul\r\n"+
 					"echo.\r\n"+
 					"ipconfig\r\n"+
 					"echo.\r\n"+
-					"echo [IBootTime] Esperando conexion con %s ...\r\n"+
+					"echo [IBootTime] Esperando conexion con %s ...\r\n"+       // 1: serverIP
 					":waitnet\r\n"+
-					"ping -n 1 -w 1000 %s >nul 2>&1\r\n"+
+					"ping -n 1 -w 1000 %s >nul 2>&1\r\n"+                      // 2: serverIP
 					"if errorlevel 1 goto waitnet\r\n"+
-					"echo [IBootTime] Conectando \\\\%s\\%s ...\r\n"+
+					"echo [IBootTime] Servidor alcanzado.\r\n"+
+					"echo.\r\n"+
+					"echo ===== PUNTO 1: net use =====\r\n"+
 					"set R=0\r\n"+
 					":retry\r\n"+
-					"net use %s: \\\\%s\\%s /user:%s %s /persistent:yes >nul 2>&1\r\n"+
+					"net use %s: \\\\%s\\%s /user:%s \"%s\"\r\n"+              // 3-7: drive,srv,share,user,pass
+					"if not errorlevel 1 goto ok\r\n"+
+					"net use %s: \\\\%s\\%s\r\n"+                              // 8-10: drive,srv,share
 					"if not errorlevel 1 goto ok\r\n"+
 					"set /a R+=1\r\n"+
-					"if %%R%% GEQ 20 goto fail\r\n"+
-					"echo [IBootTime] Reintentando (%%R%%/20)...\r\n"+
+					"if %%R%% GEQ 30 goto fail\r\n"+
+					"echo [IBootTime] Reintentando (%%R%%/30)...\r\n"+
 					"ping -n 3 127.0.0.1 >nul\r\n"+
 					"goto retry\r\n"+
 					":ok\r\n"+
-					"echo [IBootTime] %s: conectada. Lanzando instalador...\r\n"+
-					"%s:\\setup.exe\r\n"+
+					"echo ===== PUNTO 2: net use OK =====\r\n"+
+					"echo [IBootTime] %s: conectada.\r\n"+                     // 11: drive
+					"dir %s:\\ /w\r\n"+                                        // 12: drive
 					"echo.\r\n"+
-					"echo [IBootTime] El instalador se cerro o fallo.\r\n"+
-					"echo Para reintentar: %s:\\setup.exe\r\n"+
+					"echo ===== PUNTO 3: verificando setup.exe =====\r\n"+
+					"if exist %s:\\sources\\setup.exe (\r\n"+                   // 13: drive
+					"  echo [IBootTime] setup.exe encontrado OK\r\n"+
+					") else (\r\n"+
+					"  echo [IBootTime] ERROR: setup.exe NO encontrado\r\n"+
+					"  cmd /k\r\n"+
+					")\r\n"+
+					"echo.\r\n"+
+					"echo ===== PUNTO 4: Lanzando setup.exe =====\r\n"+
+					"echo [IBootTime] Presiona una tecla para lanzar setup...\r\n"+
+					"pause\r\n"+
+					"%s:\\sources\\setup.exe\r\n"+                              // 14: drive
+					"echo ===== PUNTO 5: setup termino (err=%%errorlevel%%) =====\r\n"+
+					"echo [IBootTime] El instalador se cerro.\r\n"+
+					"echo Para reintentar: %s:\\sources\\setup.exe\r\n"+        // 15: drive
 					"cmd /k\r\n"+
 					":fail\r\n"+
-					"echo [IBootTime] Error de conexion.\r\n"+
+					"echo [IBootTime] Error de conexion despues de 30 intentos.\r\n"+
 					"echo.\r\n"+
 					"ipconfig\r\n"+
 					"echo.\r\n"+
-					"echo Escribe: net use %s: \\\\%s\\%s /user:%s %s\r\n"+
-					"echo Luego: %s:\\setup.exe\r\n"+
+					"echo Intenta manual:\r\n"+
+					"echo   net use %s: \\\\%s\\%s /user:%s \"%s\"\r\n"+       // 16-20: drive,srv,share,user,pass
+					"echo   %s:\\sources\\setup.exe\r\n"+                      // 21: drive
 					"cmd /k\r\n",
-					s.serverIP,
-					s.serverIP,
-					s.serverIP, shareName,
-					driveLetter, s.serverIP, shareName, smbUser, smbPass,
-					driveLetter,
-					driveLetter,
-					driveLetter,
-					driveLetter, s.serverIP, shareName, smbUser, smbPass,
-					driveLetter,
+					s.serverIP,                                           // 1: Esperando conexion
+					s.serverIP,                                           // 2: ping
+					driveLetter, s.serverIP, shareName, smbUser, smbPass, // 3-7: net use auth
+					driveLetter, s.serverIP, shareName,                   // 8-10: net use no-auth
+					driveLetter,                                          // 11: conectada
+					driveLetter,                                          // 12: dir
+					driveLetter,                                          // 13: if exist setup.exe
+					driveLetter,                                          // 14: setup.exe
+					driveLetter,                                          // 15: reintentar
+					driveLetter, s.serverIP, shareName, smbUser, smbPass, // 16-20: fail net use
+					driveLetter,                                          // 21: fail setup
 				)
 			} else {
 				// Index 1 (plain WinPE): wpeinit + network init + wait for IP + net use
@@ -444,14 +601,16 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					":waitnet\r\n"+
 					"ping -n 1 -w 1000 %s >nul 2>&1\r\n"+
 					"if errorlevel 1 goto waitnet\r\n"+
-					"echo [IBootTime] Conectando \\\\%s\\%s ...\r\n"+
+					"echo [IBootTime] Servidor alcanzado. Conectando \\\\%s\\%s ...\r\n"+
 					"set RETRIES=0\r\n"+
 					":retry\r\n"+
-					"net use %s: \\\\%s\\%s /user:%s %s /persistent:yes >nul 2>&1\r\n"+
+					"net use %s: \\\\%s\\%s /user:%s \"%s\" /persistent:yes >nul 2>&1\r\n"+
+					"if not errorlevel 1 goto connected\r\n"+
+					"net use %s: \\\\%s\\%s /persistent:yes >nul 2>&1\r\n"+
 					"if not errorlevel 1 goto connected\r\n"+
 					"set /a RETRIES+=1\r\n"+
-					"if %%RETRIES%% GEQ 15 goto manual\r\n"+
-					"echo [IBootTime] Reintentando (%%RETRIES%%/15)...\r\n"+
+					"if %%RETRIES%% GEQ 30 goto manual\r\n"+
+					"echo [IBootTime] Reintentando (%%RETRIES%%/30)...\r\n"+
 					"ping -n 3 127.0.0.1 >nul\r\n"+
 					"goto retry\r\n"+
 					":connected\r\n"+
@@ -462,17 +621,19 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					"echo Para reintentar: %s:\\setup.exe\r\n"+
 					"cmd /k\r\n"+
 					":manual\r\n"+
-					"echo [IBootTime] Error de conexion.\r\n"+
+					"echo [IBootTime] Error de conexion despues de 30 intentos.\r\n"+
 					"echo.\r\n"+
 					"ipconfig\r\n"+
 					"echo.\r\n"+
-					"echo Escribe: net use %s: \\\\%s\\%s /user:%s %s\r\n"+
-					"echo Luego: %s:\\setup.exe\r\n"+
+					"echo Intenta manual:\r\n"+
+					"echo   net use %s: \\\\%s\\%s /user:%s \"%s\"\r\n"+
+					"echo   %s:\\setup.exe\r\n"+
 					"cmd /k\r\n",
 					s.serverIP,
 					s.serverIP,
 					s.serverIP, shareName,
 					driveLetter, s.serverIP, shareName, smbUser, smbPass,
+					driveLetter, s.serverIP, shareName,
 					driveLetter,
 					driveLetter,
 					driveLetter,
@@ -481,9 +642,31 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 				)
 			}
 
+			// -- Always inject curl.exe for autounattend.xml download --
+			s.injectCurlIntoWIM(idxMountDir)
+
+			// -- Inject VNC remote control (if enabled) --
+			if s.cfg.GetWinPERemote() {
+				vncPort := s.cfg.GetWinPEVncPort()
+				if err := s.injectVNCIntoWIM(idxMountDir, s.serverIP, s.port, vncPort); err != nil {
+					s.log.Warn("HTTP", "VNC injection index %d (non-fatal): %v", idx, err)
+				} else {
+					// Insert VNC call BEFORE :retry (after server reachable, before net use/setup)
+					// Uses "start /B cmd /c" so VNC runs in background without blocking setup
+					vncLine := "\r\n:: IBootTime VNC Remote Control\r\nstart \"\" /B cmd /c X:\\IBootTime\\vnc\\start_vnc.cmd\r\n\r\n"
+					if strings.Contains(startnetContent, ":retry\r\n") {
+						startnetContent = strings.Replace(startnetContent, ":retry\r\n", vncLine+":retry\r\n", 1)
+					} else {
+						// Fallback: insert before first "net use" line
+						startnetContent = strings.Replace(startnetContent, "net use ", vncLine+"net use ", 1)
+					}
+					s.log.Info("HTTP", "VNC remote injected into index %d", idx)
+				}
+			}
+
 			if err := os.WriteFile(startnetPath, []byte(startnetContent), 0644); err != nil {
 				s.log.Warn("HTTP", "Failed to write startnet.cmd for index %d: %v", idx, err)
-				exec.Command("dism", "/unmount-wim", "/mountdir:"+idxMountDir, "/discard").Run()
+				hidecmd.Command("dism", "/unmount-wim", "/mountdir:"+idxMountDir, "/discard").Run()
 				continue
 			}
 			s.log.Info("HTTP", "Injected startnet.cmd into index %d", idx)
@@ -509,11 +692,11 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 
 			// -- Commit changes --
 			s.log.Info("HTTP", "DISM: committing index %d...", idx)
-			dismUnmount := exec.Command("dism", "/unmount-wim",
+			dismUnmount := hidecmd.Command("dism", "/unmount-wim",
 				"/mountdir:"+idxMountDir, "/commit")
 			if out, err := dismUnmount.CombinedOutput(); err != nil {
 				s.log.Error("HTTP", "DISM commit index %d failed: %s\n%s", idx, err, string(out))
-				exec.Command("dism", "/unmount-wim", "/mountdir:"+idxMountDir, "/discard").Run()
+				hidecmd.Command("dism", "/unmount-wim", "/mountdir:"+idxMountDir, "/discard").Run()
 			} else {
 				s.log.Info("HTTP", "DISM commit index %d OK", idx)
 			}
@@ -587,7 +770,7 @@ func (s *Server) mountISO(isoPath string) (string, error) {
 
 	s.log.Info("HTTP", "Mounting ISO via Windows: %s", filepath.Base(isoPath))
 
-	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+	cmd := hidecmd.Command("powershell", "-NoProfile", "-Command",
 		fmt.Sprintf("(Mount-DiskImage -ImagePath '%s' -PassThru | Get-Volume).DriveLetter", isoPath))
 	out, err := cmd.Output()
 	if err != nil {
@@ -605,16 +788,23 @@ func (s *Server) mountISO(isoPath string) (string, error) {
 }
 
 // unmountAllISOs unmounts all ISOs that were mounted during this session.
+// Batches all unmounts into a single PowerShell call.
 func (s *Server) unmountAllISOs() {
+	var paths []string
 	s.mountedISOs.Range(func(key, value interface{}) bool {
-		isoPath := key.(string)
-		s.log.Info("HTTP", "Unmounting ISO: %s", filepath.Base(isoPath))
-		cmd := exec.Command("powershell", "-NoProfile", "-Command",
-			fmt.Sprintf("Dismount-DiskImage -ImagePath '%s'", isoPath))
-		cmd.Run()
+		paths = append(paths, key.(string))
 		s.mountedISOs.Delete(key)
 		return true
 	})
+	if len(paths) == 0 {
+		return
+	}
+	var sb strings.Builder
+	for _, p := range paths {
+		sb.WriteString(fmt.Sprintf("Dismount-DiskImage -ImagePath '%s' -ErrorAction SilentlyContinue; ", p))
+	}
+	hidecmd.Command("powershell", "-NoProfile", "-Command", sb.String()).Run()
+	s.log.Info("HTTP", "Unmounted %d ISOs", len(paths))
 }
 
 func (s *Server) handleBootScript(w http.ResponseWriter, r *http.Request) {
@@ -631,11 +821,24 @@ func (s *Server) handleBootScript(w http.ResponseWriter, r *http.Request) {
 
 	isos := s.isoMgr.ListEnabled()
 
+	// Check if this client has an assigned ISO — auto-boot it directly
+	if mac != "" {
+		if sess := s.sessions.GetByMAC(mac); sess != nil && sess.AssignedISO != "" {
+			autoScript := s.generateAutoBootScript(sess.AssignedISO, mac, arch, isos)
+			if autoScript != "" {
+				s.log.Info("HTTP", "<<< Auto-boot %s for %s (assigned)", sess.AssignedISO, mac)
+				w.Header().Set("Content-Type", "text/plain")
+				w.Write([]byte(autoScript))
+				return
+			}
+		}
+	}
+
 	var script strings.Builder
 	script.WriteString("#!ipxe\n\n")
 
-	// Variables
-	script.WriteString("set menu-timeout 0\n")
+	// Variables — 5000ms timeout for polling (checks server for ISO assignment)
+	script.WriteString("set menu-timeout 5000\n")
 	script.WriteString("set server-ip " + s.serverIP + "\n")
 	script.WriteString(fmt.Sprintf("set http-root http://${server-ip}:%d\n", s.port))
 	script.WriteString("set boot-url ${http-root}\n\n")
@@ -662,8 +865,12 @@ func (s *Server) handleBootScript(w http.ResponseWriter, r *http.Request) {
 	script.WriteString("item reboot           Reiniciar equipo\n")
 	script.WriteString("item shell            iPXE Shell\n")
 	script.WriteString("item exit             Salir al firmware\n")
-	script.WriteString("choose --timeout ${menu-timeout} --default reboot selected || goto exit\n")
+	// Timeout polls server for assigned ISO; on timeout re-fetch script to check assignment
+	script.WriteString("choose --timeout ${menu-timeout} selected || goto reload\n")
 	script.WriteString("goto ${selected}\n\n")
+
+	// Reload handler — re-fetch boot script (checks for ISO assignment)
+	script.WriteString(fmt.Sprintf(":reload\nchain ${boot-url}/boot.ipxe?mac=%s&arch=%s || goto start\n\n", mac, arch))
 
 	// === Real ISO handlers ===
 	for _, iso := range isos {
@@ -777,6 +984,84 @@ func (s *Server) handleBootScript(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(scriptContent))
+}
+
+// generateAutoBootScript produces an iPXE script that directly boots the assigned ISO.
+func (s *Server) generateAutoBootScript(isoName, mac, arch string, isos []isomgr.ISOInfo) string {
+	var target *isomgr.ISOInfo
+	for i := range isos {
+		if isos[i].Name == isoName {
+			target = &isos[i]
+			break
+		}
+	}
+	if target == nil {
+		return "" // ISO not found
+	}
+
+	var sb strings.Builder
+	sb.WriteString("#!ipxe\n\n")
+	sb.WriteString("set server-ip " + s.serverIP + "\n")
+	sb.WriteString(fmt.Sprintf("set http-root http://${server-ip}:%d\n", s.port))
+	sb.WriteString("set boot-url ${http-root}\n\n")
+	sb.WriteString(fmt.Sprintf("echo [IBootTime] ISO asignada: %s\n", target.Name))
+	sb.WriteString("echo [IBootTime] Iniciando automaticamente...\n\n")
+
+	encodedName := strings.ReplaceAll(target.Name, " ", "%20")
+	itemID := sanitizeMenuID(target.Name)
+
+	switch target.OSType {
+	case isomgr.OSTypeWindows, isomgr.OSTypeWinPE:
+		dl := "Z"
+		if letter, ok := s.winDriveLetters.Load(target.Path); ok {
+			dl = letter.(string)
+		}
+		shareName := "IB_" + sanitizeMenuID(target.Name)
+
+		sb.WriteString("imgfree\n")
+		sb.WriteString(fmt.Sprintf("iseq ${platform} efi && goto auto_uefi_%s ||\n\n", itemID))
+		// BIOS
+		sb.WriteString(fmt.Sprintf(":auto_bios_%s\n", itemID))
+		sb.WriteString(fmt.Sprintf("kernel ${boot-url}/wimboot || goto auto_fail_%s\n", itemID))
+		sb.WriteString(fmt.Sprintf("initrd --name BCD ${boot-url}/iso/%s/file/boot/bcd BCD || initrd --name BCD ${boot-url}/iso/%s/file/efi/microsoft/boot/bcd BCD || goto auto_fail_%s\n", encodedName, encodedName, itemID))
+		sb.WriteString(fmt.Sprintf("initrd --name boot.sdi ${boot-url}/iso/%s/file/boot/boot.sdi boot.sdi || goto auto_fail_%s\n", encodedName, itemID))
+		sb.WriteString(fmt.Sprintf("initrd --name boot.wim ${boot-url}/iso/%s/file/sources/boot.wim boot.wim || goto auto_fail_%s\n", encodedName, itemID))
+		sb.WriteString(fmt.Sprintf("boot || goto auto_fail_%s\n\n", itemID))
+		// UEFI
+		sb.WriteString(fmt.Sprintf(":auto_uefi_%s\n", itemID))
+		sb.WriteString(fmt.Sprintf("kernel ${boot-url}/wimboot || goto auto_fail_%s\n", itemID))
+		sb.WriteString(fmt.Sprintf("initrd --name bootx64.efi ${boot-url}/iso/%s/file/efi/boot/bootx64.efi bootx64.efi || goto auto_fail_%s\n", encodedName, itemID))
+		sb.WriteString(fmt.Sprintf("initrd --name BCD ${boot-url}/iso/%s/file/efi/microsoft/boot/bcd BCD || initrd --name BCD ${boot-url}/iso/%s/file/boot/bcd BCD || goto auto_fail_%s\n", encodedName, encodedName, itemID))
+		sb.WriteString(fmt.Sprintf("initrd --name boot.sdi ${boot-url}/iso/%s/file/boot/boot.sdi boot.sdi || goto auto_fail_%s\n", encodedName, itemID))
+		sb.WriteString(fmt.Sprintf("initrd --name boot.wim ${boot-url}/iso/%s/file/sources/boot.wim boot.wim || goto auto_fail_%s\n", encodedName, itemID))
+		sb.WriteString(fmt.Sprintf("boot || goto auto_fail_%s\n\n", itemID))
+		// Fail
+		sb.WriteString(fmt.Sprintf(":auto_fail_%s\n", itemID))
+		sb.WriteString(fmt.Sprintf("echo Error cargando %s\n", target.Name))
+		sb.WriteString(fmt.Sprintf("echo net use %s: \\\\%s\\%s /user:%s %s\n", dl, s.serverIP, shareName, smbUser, smbPass))
+		sb.WriteString(fmt.Sprintf("echo %s:\\setup.exe\n", dl))
+		sb.WriteString("prompt Presiona ENTER para volver al menu...\n")
+		sb.WriteString(fmt.Sprintf("chain ${boot-url}/boot.ipxe?mac=%s&arch=%s\n", mac, arch))
+
+	case isomgr.OSTypeLinux:
+		sb.WriteString("imgfree\n")
+		sb.WriteString(fmt.Sprintf("kernel ${boot-url}/iso/%s/file/casper/vmlinuz boot=casper netboot=url url=${boot-url}/iso/%s/raw ip=dhcp -- || goto linux_live\n", encodedName, encodedName))
+		sb.WriteString(fmt.Sprintf("initrd ${boot-url}/iso/%s/file/casper/initrd || goto linux_live\n", encodedName))
+		sb.WriteString("boot || goto linux_san\n\n")
+		sb.WriteString(":linux_live\nimgfree\n")
+		sb.WriteString(fmt.Sprintf("kernel ${boot-url}/iso/%s/file/live/vmlinuz boot=live fetch=${boot-url}/iso/%s/file/live/filesystem.squashfs ip=dhcp -- || goto linux_san\n", encodedName, encodedName))
+		sb.WriteString(fmt.Sprintf("initrd ${boot-url}/iso/%s/file/live/initrd.img || goto linux_san\n", encodedName))
+		sb.WriteString("boot || goto linux_san\n\n")
+		sb.WriteString(":linux_san\nimgfree\n")
+		sb.WriteString(fmt.Sprintf("sanboot --no-describe ${boot-url}/iso/%s/raw || goto auto_failed\n\n", encodedName))
+		sb.WriteString(":auto_failed\necho Error cargando ISO\nprompt\n")
+
+	default:
+		sb.WriteString("imgfree\n")
+		sb.WriteString(fmt.Sprintf("sanboot --no-describe ${boot-url}/iso/%s/raw || echo Error\nprompt\n", encodedName))
+	}
+
+	return sb.String()
 }
 
 func (s *Server) handleGRUBConfig(w http.ResponseWriter, r *http.Request) {
@@ -1059,6 +1344,32 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) SetServerIP(ip string) {
 	s.serverIP = ip
+}
+
+// handleISOUnattend serves the user's autounattend.xml for a given ISO.
+// GET /api/iso-unattend?iso=<name> → 200 + XML content, or 404 if not configured.
+func (s *Server) handleISOUnattend(w http.ResponseWriter, r *http.Request) {
+	isoName := r.URL.Query().Get("iso")
+	if isoName == "" {
+		http.Error(w, "missing iso parameter", http.StatusBadRequest)
+		return
+	}
+
+	path := s.isoMgr.GetUnattend(isoName)
+	if path == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		s.log.Warn("HTTP", "Failed to read autounattend.xml for %s: %v", isoName, err)
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Write(data)
 }
 
 func sanitizeMenuID(name string) string {

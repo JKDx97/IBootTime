@@ -1,9 +1,16 @@
 package session
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
+
+// normalizeMAC converts MAC to lowercase colon-separated format.
+// iPXE sends 00-23-24-b0-19-ff (hexhyp), DHCP sends 00:23:24:b0:19:ff.
+func normalizeMAC(mac string) string {
+	return strings.ToLower(strings.ReplaceAll(mac, "-", ":"))
+}
 
 type BootState string
 
@@ -28,6 +35,10 @@ type ClientSession struct {
 	Speed            string    `json:"speed"`
 	StartedAt        time.Time `json:"startedAt"`
 	LastSeen         time.Time `json:"lastSeen"`
+	RemoteAvailable  bool      `json:"remoteAvailable"`
+	RemoteVncPort    int       `json:"remoteVncPort"`
+	RemotePassword   string    `json:"remotePassword"`
+	AssignedISO      string    `json:"assignedISO"`
 }
 
 type Manager struct {
@@ -44,6 +55,7 @@ func NewManager(onUpdate func(ClientSession)) *Manager {
 }
 
 func (m *Manager) Register(mac, ip, arch string) {
+	mac = normalizeMAC(mac)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -71,6 +83,7 @@ func (m *Manager) Register(mac, ip, arch string) {
 }
 
 func (m *Manager) UpdateState(mac string, state BootState) {
+	mac = normalizeMAC(mac)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -87,6 +100,7 @@ func (m *Manager) UpdateState(mac string, state BootState) {
 }
 
 func (m *Manager) SetISO(mac, isoName string, totalBytes int64) {
+	mac = normalizeMAC(mac)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -107,6 +121,7 @@ func (m *Manager) SetISO(mac, isoName string, totalBytes int64) {
 }
 
 func (m *Manager) UpdateProgress(mac string, bytesTransferred int64, speed string) {
+	mac = normalizeMAC(mac)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -127,6 +142,7 @@ func (m *Manager) UpdateProgress(mac string, bytesTransferred int64, speed strin
 }
 
 func (m *Manager) Remove(mac string) {
+	mac = normalizeMAC(mac)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.sessions, mac)
@@ -141,6 +157,94 @@ func (m *Manager) List() []ClientSession {
 		result = append(result, *s)
 	}
 	return result
+}
+
+func (m *Manager) GetByMAC(mac string) *ClientSession {
+	mac = normalizeMAC(mac)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if s, ok := m.sessions[mac]; ok {
+		cp := *s
+		return &cp
+	}
+	return nil
+}
+
+func (m *Manager) AssignISO(mac, isoName string) bool {
+	mac = normalizeMAC(mac)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[mac]; ok {
+		s.AssignedISO = isoName
+		s.LastSeen = time.Now()
+		if m.onUpdate != nil {
+			m.onUpdate(*s)
+		}
+		return true
+	}
+	return false
+}
+
+func (m *Manager) SetRemoteReady(ip string, vncPort int, password string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Find session by IP (WinPE may not know its MAC)
+	for _, s := range m.sessions {
+		if s.IP == ip {
+			s.RemoteAvailable = true
+			s.RemoteVncPort = vncPort
+			s.RemotePassword = password
+			s.LastSeen = time.Now()
+			if m.onUpdate != nil {
+				m.onUpdate(*s)
+			}
+			return
+		}
+	}
+
+	// No existing session found — create one from IP
+	s := &ClientSession{
+		MAC:             "unknown",
+		IP:              ip,
+		State:           StateLoading,
+		RemoteAvailable: true,
+		RemoteVncPort:   vncPort,
+		RemotePassword:  password,
+		StartedAt:       time.Now(),
+		LastSeen:        time.Now(),
+	}
+	m.sessions[ip] = s
+	if m.onUpdate != nil {
+		m.onUpdate(*s)
+	}
+}
+
+func (m *Manager) UpdateStateByIP(ip string, state BootState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.sessions {
+		if s.IP == ip {
+			s.State = state
+			s.LastSeen = time.Now()
+			if m.onUpdate != nil {
+				m.onUpdate(*s)
+			}
+			return
+		}
+	}
+}
+
+func (m *Manager) GetByIP(ip string) *ClientSession {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		if s.IP == ip {
+			cp := *s
+			return &cp
+		}
+	}
+	return nil
 }
 
 func (m *Manager) CleanStale(timeout time.Duration) {

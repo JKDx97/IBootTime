@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 
 	"IBootTime/internal/config"
 	"IBootTime/internal/dhcpsrv"
+	"IBootTime/internal/hidecmd"
 	"IBootTime/internal/httpboot"
 	"IBootTime/internal/isomgr"
 	"IBootTime/internal/logger"
@@ -19,12 +20,16 @@ import (
 )
 
 type ServiceStatus struct {
-	DHCP         bool   `json:"dhcp"`
-	TFTP         bool   `json:"tftp"`
-	HTTP         bool   `json:"http"`
-	Running      bool   `json:"running"`
-	IP           string `json:"ip"`
-	BootProtocol string `json:"bootProtocol"`
+	DHCP            bool   `json:"dhcp"`
+	TFTP            bool   `json:"tftp"`
+	HTTP            bool   `json:"http"`
+	Running         bool   `json:"running"`
+	IP              string `json:"ip"`
+	HTTPPort        int    `json:"httpPort"`
+	BootProtocol    string `json:"bootProtocol"`
+	StartupPhase    string `json:"startupPhase"`
+	StartupProgress int    `json:"startupProgress"`
+	StartupDetail   string `json:"startupDetail"`
 }
 
 type Orchestrator struct {
@@ -96,39 +101,62 @@ func (o *Orchestrator) StartAll() error {
 
 	o.status = ServiceStatus{
 		IP:           serverIP,
+		HTTPPort:     o.cfg.HTTPPort,
 		BootProtocol: string(bootProto),
 	}
 
 	o.log.Info("Orchestrator", "Starting services: IP=%s protocol=%s (proxy PXE)", serverIP, bootProto)
 
-	// Auto-configure Windows Firewall for PXE boot ports
+	// Phase: Firewall
+	o.status.StartupPhase = "firewall"
+	o.status.StartupProgress = 5
+	o.status.StartupDetail = "Configurando firewall..."
+	o.emitStatus()
 	o.ensureFirewallRules()
 
-	// Start TFTP (now receives config for boot protocol and network mode)
+	// Phase: TFTP
+	o.status.StartupPhase = "services"
+	o.status.StartupProgress = 15
+	o.status.StartupDetail = "Iniciando TFTP..."
+	o.emitStatus()
 	o.tftp = tftpsrv.New(o.cfg.TFTPPort, serverIP, o.cfg.HTTPPort, o.log, o.sessions, o.isoMgr, o.cfg)
 	if err := o.tftp.Start(ctx); err != nil {
 		cancel()
+		o.status = ServiceStatus{}
+		o.emitStatus()
 		return fmt.Errorf("starting TFTP: %w", err)
 	}
 	o.status.TFTP = true
 	o.log.Info("Orchestrator", "TFTP server started on :%d", o.cfg.TFTPPort)
 
-	// Start HTTP (now receives config for network mode)
+	// Phase: HTTP
+	o.status.StartupProgress = 30
+	o.status.StartupDetail = "Iniciando HTTP..."
+	o.emitStatus()
 	o.http = httpboot.New(o.cfg.HTTPPort, serverIP, o.isoMgr, o.log, o.sessions, o.cfg)
 	if err := o.http.Start(ctx); err != nil {
 		o.tftp.Stop()
 		cancel()
+		o.status = ServiceStatus{}
+		o.emitStatus()
 		return fmt.Errorf("starting HTTP: %w", err)
 	}
 	o.status.HTTP = true
 	o.log.Info("Orchestrator", "HTTP boot server started on :%d", o.cfg.HTTPPort)
 
-	// Start DHCP (already has config reference)
-	o.dhcp = dhcpsrv.New(o.cfg, serverIP, o.log, o.sessions)
+	// Phase: DHCP
+	o.status.StartupProgress = 45
+	o.status.StartupDetail = "Iniciando DHCP..."
+	o.emitStatus()
+	gatewayIP := netinfo.GetDefaultGateway(serverIP)
+	o.log.Info("Orchestrator", "Detected gateway: %s", gatewayIP)
+	o.dhcp = dhcpsrv.New(o.cfg, serverIP, gatewayIP, o.log, o.sessions)
 	if err := o.dhcp.Start(ctx); err != nil {
 		o.http.Stop()
 		o.tftp.Stop()
 		cancel()
+		o.status = ServiceStatus{}
+		o.emitStatus()
 		return fmt.Errorf("starting DHCP: %w", err)
 	}
 	o.status.DHCP = true
@@ -136,9 +164,41 @@ func (o *Orchestrator) StartAll() error {
 
 	o.running = true
 	o.status.Running = true
-
+	o.status.StartupPhase = "ready"
+	o.status.StartupProgress = 100
+	o.status.StartupDetail = ""
 	o.emitStatus()
-	o.log.Info("Orchestrator", "All services started on %s [proto=%s, mode=proxy PXE]", serverIP, bootProto)
+	o.log.Info("Orchestrator", "Servidor LISTO en %s [proto=%s] — clientes pueden PXE boot", serverIP, bootProto)
+
+	// ISO prep runs in background — show as secondary progress
+	o.http.SetPrepProgressCallback(func(phase string, current, total int, detail string) {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if !o.running {
+			return
+		}
+		pct := 0
+		if total > 0 {
+			pct = (current * 100) / total
+		}
+		o.status.StartupPhase = "preparing"
+		o.status.StartupProgress = pct
+		o.status.StartupDetail = detail
+		o.emitStatus()
+	})
+
+	o.http.SetPrepDoneCallback(func() {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if !o.running {
+			return
+		}
+		o.status.StartupPhase = "ready"
+		o.status.StartupProgress = 100
+		o.status.StartupDetail = ""
+		o.emitStatus()
+		o.log.Info("Orchestrator", "Todas las ISOs preparadas en %s", o.status.IP)
+	})
 
 	return nil
 }
@@ -186,6 +246,18 @@ func (o *Orchestrator) GetStatus() ServiceStatus {
 	return o.status
 }
 
+// TriggerRemote tells the HTTP server to set the reverse-VNC trigger flag
+// for the given client IP. The WinPE client will pick it up on its next poll.
+func (o *Orchestrator) TriggerRemote(ip string) error {
+	o.mu.Lock()
+	h := o.http
+	o.mu.Unlock()
+	if h == nil {
+		return fmt.Errorf("HTTP server is not running")
+	}
+	return h.TriggerRemote(ip)
+}
+
 func (o *Orchestrator) emitStatus() {
 	if o.onStatusChange != nil {
 		o.onStatusChange(o.status)
@@ -197,12 +269,14 @@ func (o *Orchestrator) ensureFirewallRules() {
 		return
 	}
 
-	rules := []struct {
+	type rule struct {
 		name  string
 		dir   string
 		proto string
 		port  string
-	}{
+	}
+
+	rules := []rule{
 		{"IBootTime DHCP-In", "in", "udp", "67,68,4011"},
 		{"IBootTime DHCP-Out", "out", "udp", "67,68,4011"},
 		{"IBootTime TFTP-In", "in", "udp", "69"},
@@ -212,40 +286,38 @@ func (o *Orchestrator) ensureFirewallRules() {
 		{"IBootTime HTTP", "in", "tcp", fmt.Sprintf("%d", o.cfg.HTTPPort)},
 		{"IBootTime SMB-In", "in", "tcp", "445"},
 		{"IBootTime SMB-Out", "out", "tcp", "445"},
+		{"IBootTime VNC-In", "in", "tcp", fmt.Sprintf("%d", o.cfg.GetWinPEVncPort())},
+		// Reverse VNC listener: WinPE clients dial in to us on 5500.
+		{"IBootTime VNC-Reverse-In", "in", "tcp", "5500"},
 	}
 
+	// Build a single batch script that does ALL firewall operations at once
+	// instead of spawning 20+ separate netsh processes.
+	var sb strings.Builder
 	for _, r := range rules {
-		// Delete existing rule first (idempotent)
-		exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+r.name).Run()
-
-		// Add rule
-		err := exec.Command("netsh", "advfirewall", "firewall", "add", "rule",
-			"name="+r.name, "dir="+r.dir, "action=allow",
-			"protocol="+r.proto, "localport="+r.port, "profile=any",
-		).Run()
-		if err != nil {
-			o.log.Warn("Orchestrator", "Firewall rule '%s' failed: %v (run as admin?)", r.name, err)
-		} else {
-			o.log.Info("Orchestrator", "Firewall rule added: %s (%s %s/%s)", r.name, r.dir, r.proto, r.port)
-		}
+		sb.WriteString(fmt.Sprintf(
+			"netsh advfirewall firewall delete rule name=\"%s\" >nul 2>&1\n"+
+				"netsh advfirewall firewall add rule name=\"%s\" dir=%s action=allow protocol=%s localport=%s profile=any >nul 2>&1\n",
+			r.name, r.name, r.dir, r.proto, r.port))
 	}
 
-	// Also add PROGRAM-based rules — allows ALL traffic from/to IBootTime.exe.
-	// This catches edge cases where port rules don't cover broadcast/multicast.
+	// Program-based rules
 	exePath, err := os.Executable()
 	if err == nil {
 		for _, dir := range []string{"in", "out"} {
 			ruleName := "IBootTime Program-" + dir
-			exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+ruleName).Run()
-			err := exec.Command("netsh", "advfirewall", "firewall", "add", "rule",
-				"name="+ruleName, "dir="+dir, "action=allow",
-				"program="+exePath, "enable=yes", "profile=any",
-			).Run()
-			if err != nil {
-				o.log.Warn("Orchestrator", "Program firewall rule '%s' failed: %v", ruleName, err)
-			} else {
-				o.log.Info("Orchestrator", "Program firewall rule added: %s (%s)", ruleName, exePath)
-			}
+			sb.WriteString(fmt.Sprintf(
+				"netsh advfirewall firewall delete rule name=\"%s\" >nul 2>&1\n"+
+					"netsh advfirewall firewall add rule name=\"%s\" dir=%s action=allow program=\"%s\" enable=yes profile=any >nul 2>&1\n",
+				ruleName, ruleName, dir, exePath))
 		}
+	}
+
+	// Execute everything in ONE hidden cmd.exe process
+	cmd := hidecmd.Command("cmd", "/C", sb.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		o.log.Warn("Orchestrator", "Firewall batch failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	} else {
+		o.log.Info("Orchestrator", "Firewall rules configured (%d rules)", len(rules)+2)
 	}
 }

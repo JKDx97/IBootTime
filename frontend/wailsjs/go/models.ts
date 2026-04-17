@@ -8,6 +8,7 @@ export namespace isomgr {
 	    osType: string;
 	    arch: string;
 	    enabled: boolean;
+	    unattendPath: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ISOInfo(source);
@@ -22,6 +23,7 @@ export namespace isomgr {
 	        this.osType = source["osType"];
 	        this.arch = source["arch"];
 	        this.enabled = source["enabled"];
+	        this.unattendPath = source["unattendPath"];
 	    }
 	}
 
@@ -102,7 +104,11 @@ export namespace orchestrator {
 	    http: boolean;
 	    running: boolean;
 	    ip: string;
+	    httpPort: number;
 	    bootProtocol: string;
+	    startupPhase: string;
+	    startupProgress: number;
+	    startupDetail: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ServiceStatus(source);
@@ -115,7 +121,11 @@ export namespace orchestrator {
 	        this.http = source["http"];
 	        this.running = source["running"];
 	        this.ip = source["ip"];
+	        this.httpPort = source["httpPort"];
 	        this.bootProtocol = source["bootProtocol"];
+	        this.startupPhase = source["startupPhase"];
+	        this.startupProgress = source["startupProgress"];
+	        this.startupDetail = source["startupDetail"];
 	    }
 	}
 
@@ -137,6 +147,10 @@ export namespace session {
 	    startedAt: any;
 	    // Go type: time
 	    lastSeen: any;
+	    remoteAvailable: boolean;
+	    remoteVncPort: number;
+	    remotePassword: string;
+	    assignedISO: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ClientSession(source);
@@ -155,6 +169,10 @@ export namespace session {
 	        this.speed = source["speed"];
 	        this.startedAt = this.convertValues(source["startedAt"], null);
 	        this.lastSeen = this.convertValues(source["lastSeen"], null);
+	        this.remoteAvailable = source["remoteAvailable"];
+	        this.remoteVncPort = source["remoteVncPort"];
+	        this.remotePassword = source["remotePassword"];
+	        this.assignedISO = source["assignedISO"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

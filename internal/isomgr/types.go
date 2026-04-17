@@ -11,11 +11,12 @@ const (
 )
 
 type ISOInfo struct {
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Size     int64  `json:"size"`
-	SizeHR   string `json:"sizeHR"`
-	OSType   OSType `json:"osType"`
-	Arch     string `json:"arch"`
-	Enabled  bool   `json:"enabled"`
+	Name         string `json:"name"`
+	Path         string `json:"path"`
+	Size         int64  `json:"size"`
+	SizeHR       string `json:"sizeHR"`
+	OSType       OSType `json:"osType"`
+	Arch         string `json:"arch"`
+	Enabled      bool   `json:"enabled"`
+	UnattendPath string `json:"unattendPath"`
 }

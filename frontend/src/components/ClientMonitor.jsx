@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Monitor, Wifi } from 'lucide-react'
-import { GetConnectedClients } from '../../wailsjs/go/main/App'
+import { Monitor, Wifi, ScreenShare, Lock, Send, ChevronDown } from 'lucide-react'
+import { GetConnectedClients, GetServerStatus, GetISOList, AssignISO } from '../../wailsjs/go/main/App'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import clsx from 'clsx'
 
@@ -26,24 +26,53 @@ function ProgressBar({ value }) {
 
 export default function ClientMonitor() {
   const [clients, setClients] = useState([])
+  const [serverStatus, setServerStatus] = useState(null)
+  const [isos, setIsos] = useState([])
 
   useEffect(() => {
     GetConnectedClients().then((c) => setClients(c || []))
+    GetServerStatus().then((s) => setServerStatus(s))
+    GetISOList().then((l) => setIsos((l || []).filter(i => i.enabled)))
 
     const unsub = EventsOn('client:updated', () => {
       GetConnectedClients().then((c) => setClients(c || []))
     })
-    return () => unsub()
+    const unsub2 = EventsOn('server:status-changed', (s) => setServerStatus(s))
+    const unsub3 = EventsOn('iso:list-changed', (l) => setIsos((l || []).filter(i => i.enabled)))
+    return () => { unsub(); unsub2(); unsub3() }
   }, [])
+
+  const handleAssignISO = async (mac, isoName) => {
+    await AssignISO(mac, isoName)
+  }
+
+  const handleConnect = (client) => {
+    const serverIP = serverStatus?.ip || window.location.hostname
+    const httpPort = serverStatus?.httpPort || 8080
+    const port = client.remoteVncPort || 5900
+    const pw = client.remotePassword || ''
+    const url = `http://${serverIP}:${httpPort}/novnc?host=${client.ip}&port=${port}&password=${encodeURIComponent(pw)}`
+    window.open(url, '_blank')
+  }
+
+  const remoteCount = clients.filter(c => c.remoteAvailable).length
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold text-white">Client Monitor</h2>
-        <span className="flex items-center gap-2 text-sm text-slate-400">
-          <Wifi size={14} />
-          {clients.length} client{clients.length !== 1 ? 's' : ''} connected
-        </span>
+        <div className="flex items-center gap-4">
+          {remoteCount > 0 && (
+            <span className="flex items-center gap-1.5 text-xs text-emerald-400">
+              <ScreenShare size={13} />
+              {remoteCount} remote disponible{remoteCount !== 1 ? 's' : ''}
+            </span>
+          )}
+          <span className="flex items-center gap-2 text-sm text-slate-400">
+            <Wifi size={14} />
+            {clients.length} client{clients.length !== 1 ? 's' : ''} connected
+          </span>
+        </div>
       </div>
 
       {clients.length === 0 ? (
@@ -63,9 +92,11 @@ export default function ClientMonitor() {
                 <th className="text-left px-4 py-3">IP Address</th>
                 <th className="text-left px-4 py-3">Arch</th>
                 <th className="text-left px-4 py-3">Status</th>
-                <th className="text-left px-4 py-3">ISO</th>
+                <th className="text-left px-4 py-3">ISO Actual</th>
+                <th className="text-left px-4 py-3">Boot Remoto</th>
                 <th className="text-left px-4 py-3 w-40">Progress</th>
                 <th className="text-right px-4 py-3">Speed</th>
+                <th className="text-center px-4 py-3">Remote</th>
               </tr>
             </thead>
             <tbody>
@@ -88,6 +119,30 @@ export default function ClientMonitor() {
                       {client.isoName || '-'}
                     </td>
                     <td className="px-4 py-3">
+                      {client.state !== 'completed' && client.state !== 'error' ? (
+                        <div className="flex items-center gap-1.5">
+                          <select
+                            value={client.assignedISO || ''}
+                            onChange={(e) => handleAssignISO(client.mac, e.target.value)}
+                            className="text-xs bg-slate-800 border border-slate-600 rounded-lg px-2 py-1.5 text-white max-w-[160px] focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
+                          >
+                            <option value="">-- Seleccionar ISO --</option>
+                            {isos.map((iso) => (
+                              <option key={iso.name} value={iso.name}>{iso.name}</option>
+                            ))}
+                          </select>
+                          {client.assignedISO && (
+                            <span className="flex items-center gap-1 text-xs text-emerald-400 whitespace-nowrap">
+                              <Send size={11} />
+                              Enviado
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-xs text-slate-600">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
                       {client.state === 'loading' ? (
                         <div className="flex items-center gap-2">
                           <ProgressBar value={client.progress} />
@@ -101,6 +156,20 @@ export default function ClientMonitor() {
                     </td>
                     <td className="px-4 py-3 text-sm text-slate-400 text-right font-mono">
                       {client.speed || '-'}
+                    </td>
+                    <td className="px-4 py-3 text-center">
+                      {client.remoteAvailable ? (
+                        <button
+                          onClick={() => handleConnect(client)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25 transition-colors"
+                          title={`VNC: ${client.ip}:${client.remoteVncPort}`}
+                        >
+                          <ScreenShare size={13} />
+                          Connect
+                        </button>
+                      ) : (
+                        <span className="text-xs text-slate-600">-</span>
+                      )}
                     </td>
                   </tr>
                 )

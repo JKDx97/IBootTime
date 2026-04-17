@@ -22,6 +22,10 @@ type Config struct {
 	HTTPPort      int          `json:"httpPort"`
 	TFTPPort      int          `json:"tftpPort"`
 	BootProtocol  BootProtocol `json:"bootProtocol"`
+	WinPERemote   bool         `json:"winpeRemote"`
+	WinPEVncPort  int          `json:"winpeVncPort"`
+	DisabledISOs  []string            `json:"disabledISOs,omitempty"`
+	ISOUnattend   map[string]string   `json:"isoUnattend,omitempty"`
 	configPath    string
 }
 
@@ -31,6 +35,8 @@ func DefaultConfig() *Config {
 		HTTPPort:     8080,
 		TFTPPort:     69,
 		BootProtocol: BootProtocolIPXE,
+		WinPERemote:  true,
+		WinPEVncPort: 5900,
 	}
 }
 
@@ -96,4 +102,56 @@ func (c *Config) GetBootProtocol() BootProtocol {
 	return c.BootProtocol
 }
 
+func (c *Config) GetWinPERemote() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.WinPERemote
+}
+
+func (c *Config) GetWinPEVncPort() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.WinPEVncPort == 0 {
+		return 5900
+	}
+	return c.WinPEVncPort
+}
+
+func (c *Config) GetDisabledISOs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make([]string, len(c.DisabledISOs))
+	copy(result, c.DisabledISOs)
+	return result
+}
+
+func (c *Config) IsISODisabled(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, n := range c.DisabledISOs {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) GetISOUnattend(name string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ISOUnattend == nil {
+		return ""
+	}
+	return c.ISOUnattend[name]
+}
+
+func (c *Config) GetAllISOUnattend() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make(map[string]string)
+	for k, v := range c.ISOUnattend {
+		result[k] = v
+	}
+	return result
+}
 
