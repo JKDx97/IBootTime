@@ -107,12 +107,13 @@ func (o *Orchestrator) StartAll() error {
 
 	o.log.Info("Orchestrator", "Starting services: IP=%s protocol=%s (proxy PXE)", serverIP, bootProto)
 
-	// Phase: Firewall
+	// Phase: Firewall + SMB
 	o.status.StartupPhase = "firewall"
 	o.status.StartupProgress = 5
-	o.status.StartupDetail = "Configurando firewall..."
+	o.status.StartupDetail = "Configurando firewall y SMB..."
 	o.emitStatus()
 	o.ensureFirewallRules()
+	o.ensureSMBGuestAccess()
 
 	// Phase: TFTP
 	o.status.StartupPhase = "services"
@@ -261,6 +262,38 @@ func (o *Orchestrator) TriggerRemote(ip string) error {
 func (o *Orchestrator) emitStatus() {
 	if o.onStatusChange != nil {
 		o.onStatusChange(o.status)
+	}
+}
+
+// ensureSMBGuestAccess ensures that the server allows guest/anonymous SMB access.
+// Modern Windows 10 (1709+) and Windows 11 disable insecure guest auth by default,
+// which causes WinPE "net use" to fail even when the share has Everyone FullAccess.
+// This sets the required registry keys and restarts the LanmanWorkstation service.
+func (o *Orchestrator) ensureSMBGuestAccess() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	// Enable insecure guest auth on the SERVER so WinPE clients can connect
+	// without requiring a valid domain/local account.
+	script := strings.Join([]string{
+		// Server-side: allow guest fallback for SMB shares
+		`Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'RestrictNullSessAccess' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue`,
+		// Client-side (for local testing): allow insecure guest auth
+		`$p = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'`,
+		`if (!(Test-Path $p)) { New-Item -Path $p -Force | Out-Null }`,
+		`Set-ItemProperty -Path $p -Name 'AllowInsecureGuestAuth' -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue`,
+		// Ensure SMB server is enabled and started
+		`Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force -ErrorAction SilentlyContinue`,
+		// Restart LanmanServer to pick up changes
+		`Restart-Service LanmanServer -Force -ErrorAction SilentlyContinue`,
+	}, "; ")
+
+	cmd := hidecmd.Command("powershell", "-NoProfile", "-Command", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		o.log.Warn("Orchestrator", "SMB guest access config had issues: %v (%s)", err, strings.TrimSpace(string(out)))
+	} else {
+		o.log.Info("Orchestrator", "SMB guest access configured (insecure guest auth enabled)")
 	}
 }
 

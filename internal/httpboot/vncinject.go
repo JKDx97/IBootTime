@@ -204,10 +204,30 @@ func buildVNCStartScript(serverIP string, httpPort, vncPort int) string {
 	sb.WriteString("echo [IBootTime] VNC: curl.exe OK\r\n")
 	sb.WriteString("\r\n")
 
+	// Show server URL for diagnostics
+	sb.WriteString("echo [IBootTime] VNC: Servidor: %IBTSERVER%\r\n")
+	sb.WriteString("\r\n")
+
+	// Verify HTTP connectivity before VNC-specific endpoints
+	sb.WriteString(":: Quick HTTP connectivity check\r\n")
+	sb.WriteString("echo [IBootTime] VNC: Verificando conectividad HTTP...\r\n")
+	sb.WriteString("%CURL% -s -o nul --connect-timeout 5 --max-time 8 \"%IBTSERVER%/health\"\r\n")
+	sb.WriteString("if errorlevel 1 (\r\n")
+	sb.WriteString("  echo [IBootTime] VNC: No se pudo contactar servidor HTTP. Reintentando...\r\n")
+	sb.WriteString("  ping -n 6 127.0.0.1 >nul\r\n")
+	sb.WriteString("  %CURL% -s -o nul --connect-timeout 10 --max-time 15 \"%IBTSERVER%/health\"\r\n")
+	sb.WriteString("  if errorlevel 1 (\r\n")
+	sb.WriteString("    echo [IBootTime] VNC: Servidor HTTP no disponible. Abortando VNC.\r\n")
+	sb.WriteString("    goto :vnc_end\r\n")
+	sb.WriteString("  )\r\n")
+	sb.WriteString(")\r\n")
+	sb.WriteString("echo [IBootTime] VNC: Conectividad HTTP OK\r\n")
+	sb.WriteString("\r\n")
+
 	// Fetch VNC password from dedicated plaintext endpoint (no JSON parsing needed)
 	sb.WriteString(":: Fetch VNC password (plain text)\r\n")
 	sb.WriteString("echo [IBootTime] VNC: Obteniendo password del servidor...\r\n")
-	sb.WriteString("%CURL% -s -o X:\\IBootTime\\vnc\\_pw.txt --connect-timeout 15 --retry 3 --retry-delay 2 \"%IBTSERVER%/api/winpe/vnc-password\"\r\n")
+	sb.WriteString("%CURL% -s -o X:\\IBootTime\\vnc\\_pw.txt --connect-timeout 8 --max-time 15 --retry 2 --retry-delay 2 \"%IBTSERVER%/api/winpe/vnc-password\"\r\n")
 	sb.WriteString("if errorlevel 1 (\r\n")
 	sb.WriteString("  echo [IBootTime] VNC: Error obteniendo password.\r\n")
 	sb.WriteString("  goto :vnc_end\r\n")

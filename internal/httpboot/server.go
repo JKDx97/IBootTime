@@ -187,7 +187,7 @@ func (s *Server) cleanupSMBShares() {
 
 const smbUser = "Administrador"
 const smbPass = "P0s31d0n"
-const cacheVersion = "v28-bare-setup"
+const cacheVersion = "v29-dynamic-cache"
 
 // safeNetDriveLetters lists drive letters safe for net use in WinPE.
 // Avoids: A/B (floppy), C (system), D (common CD/HDD), E (common),
@@ -424,11 +424,19 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 	wimStat, wimErr := os.Stat(cachedWim)
 	needRebuild := wimErr != nil || (isoStat != nil && wimStat.ModTime().Before(isoStat.ModTime()))
 
-	// Version marker — if injection logic changes, bump this to force rebuild
+	// Version marker — includes server IP, port, and VNC config so WIM is
+	// rebuilt automatically whenever the network environment changes.
+	fullVersion := fmt.Sprintf("%s|ip=%s|port=%d|vnc=%v|vncport=%d|user=%s",
+		cacheVersion, s.serverIP, s.port,
+		s.cfg.GetWinPERemote(), s.cfg.GetWinPEVncPort(), smbUser)
 	versionFile := filepath.Join(cacheDir, ".version")
-	if versionData, err := os.ReadFile(versionFile); err == nil && string(versionData) == cacheVersion {
+	if versionData, err := os.ReadFile(versionFile); err == nil && string(versionData) == fullVersion {
 		// version matches — keep existing rebuild decision
 	} else {
+		if versionData != nil {
+			s.log.Info("HTTP", "Cache version mismatch for %s: stored=%q current=%q — rebuilding",
+				iso.Name, string(versionData), fullVersion)
+		}
 		needRebuild = true // version mismatch or missing, force rebuild
 	}
 
@@ -703,8 +711,8 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 		}
 
 		// Write version marker
-		os.WriteFile(versionFile, []byte(cacheVersion), 0644)
-		s.log.Info("HTTP", "Modified boot.wim saved to cache (version: %s)", cacheVersion)
+		os.WriteFile(versionFile, []byte(fullVersion), 0644)
+		s.log.Info("HTTP", "Modified boot.wim saved to cache (version: %s)", fullVersion)
 	} else {
 		s.log.Info("HTTP", "Using cached boot.wim for %s (version OK)", iso.Name)
 	}
