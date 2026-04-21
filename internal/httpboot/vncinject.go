@@ -132,6 +132,18 @@ func (s *Server) injectVNCIntoWIM(mountDir, serverIP string, httpPort, vncPort i
 		return fmt.Errorf("write VNC script: %w", err)
 	}
 
+	postInstallScript := s.buildPostInstallVNCScript(vncPort)
+	postInstallPath := filepath.Join(destDir, "postinstall_vnc.ps1")
+	if err := os.WriteFile(postInstallPath, []byte(postInstallScript), 0644); err != nil {
+		return fmt.Errorf("write post-install VNC script: %w", err)
+	}
+
+	bootstrapScript := s.buildPostInstallBootstrapCMD()
+	bootstrapPath := filepath.Join(destDir, "install_post_vnc.cmd")
+	if err := os.WriteFile(bootstrapPath, []byte(bootstrapScript), 0644); err != nil {
+		return fmt.Errorf("write post-install bootstrap script: %w", err)
+	}
+
 	s.log.Info("VNC", "VNC startup script written to WIM")
 	return nil
 }

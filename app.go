@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"IBootTime/internal/agentproxy"
 	"IBootTime/internal/config"
 	"IBootTime/internal/isomgr"
 	"IBootTime/internal/logger"
@@ -24,6 +25,7 @@ type App struct {
 	isoMgr       *isomgr.Manager
 	sessions     *session.Manager
 	orchestrator *orchestrator.Orchestrator
+	agentProxy   *agentproxy.Proxy
 }
 
 func NewApp() *App {
@@ -87,10 +89,16 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}()
 
+	// Initialize agent proxy to Python server
+	a.agentProxy = agentproxy.New("http://127.0.0.1:9090")
+
 	a.log.Info("App", "IBootTime initialized")
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	if a.agentProxy != nil {
+		a.agentProxy.Stop()
+	}
 	if a.orchestrator != nil && a.orchestrator.IsRunning() {
 		a.orchestrator.StopAll()
 	}
@@ -100,11 +108,24 @@ func (a *App) shutdown(ctx context.Context) {
 
 func (a *App) StartServer() error {
 	a.log.Info("App", "Starting all services...")
+
+	// Start Python agent server first
+	if err := a.agentProxy.Start(); err != nil {
+		a.log.Warn("App", "Agent server failed to start: %v (continuing without it)", err)
+	} else {
+		a.log.Info("App", "Python agent server started on :9090")
+	}
+
 	return a.orchestrator.StartAll()
 }
 
 func (a *App) StopServer() error {
 	a.log.Info("App", "Stopping all services...")
+
+	// Stop Python agent server
+	a.agentProxy.Stop()
+	a.log.Info("App", "Python agent server stopped")
+
 	return a.orchestrator.StopAll()
 }
 
@@ -294,4 +315,24 @@ func (a *App) BrowseISOUnattend(isoName string) (string, error) {
 	return filePath, nil
 }
 
+// ==================== Remote Agent (Python proxy) ====================
 
+func (a *App) AgentListClients() ([]agentproxy.RemoteClient, error) {
+	return a.agentProxy.ListClients()
+}
+
+func (a *App) AgentPing(clientID string) (*agentproxy.TaskResponse, error) {
+	return a.agentProxy.PingClient(clientID)
+}
+
+func (a *App) AgentCreateTestFile(clientID string) (*agentproxy.TaskResponse, error) {
+	return a.agentProxy.CreateTestFile(clientID)
+}
+
+func (a *App) AgentOpenNotepad(clientID string) (*agentproxy.TaskResponse, error) {
+	return a.agentProxy.OpenNotepad(clientID)
+}
+
+func (a *App) AgentGetTasks(clientID string) ([]agentproxy.RemoteTask, error) {
+	return a.agentProxy.GetClientTasks(clientID)
+}

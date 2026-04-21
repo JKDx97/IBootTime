@@ -150,11 +150,20 @@ func (s *Server) handleVNCProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate that this client is known
+	// Validate that this client is known — but for reverse mode, be lenient:
+	// if a reverse connection exists, allow it even without a formal session.
 	sess := s.sessions.GetByIP(clientHost)
 	if sess == nil || !sess.RemoteAvailable {
-		http.Error(w, "client not available for remote", http.StatusForbidden)
-		return
+		hasReverse := s.reverseVNC != nil && s.reverseVNC.HasConn(clientHost)
+		if !hasReverse && (mode == "reverse" || mode == "auto") {
+			// No session and no reverse conn — reject
+			http.Error(w, "client not available for remote", http.StatusForbidden)
+			return
+		}
+		if hasReverse && sess == nil {
+			// Auto-create session so future calls work
+			s.sessions.SetRemoteReady(clientHost, 0, "")
+		}
 	}
 
 	var vncConn net.Conn
@@ -163,12 +172,11 @@ func (s *Server) handleVNCProxy(w http.ResponseWriter, r *http.Request) {
 	// --- Try reverse mode first ---
 	if mode == "reverse" || mode == "auto" {
 		if s.reverseVNC != nil {
-			// If a conn is already waiting, take it immediately.
-			// Otherwise wait briefly for UltraVNC -autoreconnect to dial in.
-			waitFor := 2 * time.Second
-			if mode == "reverse" {
-				waitFor = 30 * time.Second
-			}
+			// With -autoreconnect on the client, winvnc keeps dialing back
+			// to port 5500 automatically. Just wait for the next connection.
+			// Do NOT drop or re-trigger — that kills active sessions.
+			waitFor := 30 * time.Second
+			s.log.Info("VNC", "Waiting up to %v for reverse conn from %s …", waitFor, clientHost)
 			if c := s.reverseVNC.WaitForConn(clientHost, waitFor); c != nil {
 				vncConn = c
 				target = "reverse:" + clientHost

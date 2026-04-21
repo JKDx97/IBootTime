@@ -140,122 +140,237 @@ func (s *Server) buildPostInstallVNCScript(vncPort int) string {
 	}
 
 	return fmt.Sprintf(`# IBootTime Post-Install VNC Setup Script
-# This script is downloaded and executed by the unattend.xml specialize pass.
-# It runs as SYSTEM during Windows setup, before the OOBE screens appear.
 
-$ErrorActionPreference = "SilentlyContinue"
-$serverIP   = "%s"
-$httpPort   = %d
-$server     = "http://${serverIP}:${httpPort}"
-$vncDir     = "C:\IBootTime\vnc"
-$vncPort    = %d
+$ErrorActionPreference = "Stop"
+$serverIP    = "%s"
+$httpPort    = %d
+$server      = "http://${serverIP}:${httpPort}"
+$vncDir      = "C:\IBootTime\vnc"
+$vncPort     = %d
 $reversePort = %d
+$lockFile    = "$vncDir\.postinstall.lock"
+$logFile     = "$vncDir\postinstall.log"
 
-# --- Create VNC directory ---
+function Log($msg) {
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts] $msg"
+    Write-Host $line
+    try { $line | Out-File -Append -FilePath $logFile -Encoding utf8 } catch {}
+}
+
 New-Item -ItemType Directory -Path $vncDir -Force | Out-Null
+Log "=== IBootTime VNC PostInstall START (PID=$PID) ==="
+Log "Server=$server  vncPort=$vncPort  reversePort=$reversePort"
 
-# --- Wait for network ---
-Write-Host "[IBootTime] VNC PostInstall: Esperando red..."
-$timeout = 120
-$elapsed = 0
-while (-not (Test-Connection $serverIP -Count 1 -Quiet) -and $elapsed -lt $timeout) {
-    Start-Sleep -Seconds 2
-    $elapsed += 2
+# --- Instance lock ---
+if (Test-Path $lockFile) {
+    $lockPid = Get-Content $lockFile -ErrorAction SilentlyContinue
+    if ($lockPid) {
+        $existingProc = $null
+        try { $existingProc = Get-Process -Id ([int]$lockPid) -ErrorAction Stop } catch {}
+        if ($existingProc -and $existingProc.ProcessName -match "(?i)^(powershell|pwsh)$") {
+            Log "Otra instancia corriendo (PID $lockPid). Saliendo."
+            exit 0
+        }
+    }
+    Log "Lock stale (PID=$lockPid ya no existe), limpiando..."
+    Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
 }
-if ($elapsed -ge $timeout) {
-    Write-Host "[IBootTime] VNC PostInstall: No se pudo contactar al servidor. Abortando."
-    exit 1
-}
-Write-Host "[IBootTime] VNC PostInstall: Servidor alcanzado."
+$PID | Out-File $lockFile -Force
+Log "Lock adquirido (PID=$PID)"
 
-# --- Download essential VNC files ---
-$files = @(%s)
-foreach ($f in $files) {
-    Write-Host "[IBootTime] VNC PostInstall: Descargando $f..."
+# --- Wait for server (HTTP, infinite retry) ---
+Log "Esperando servidor HTTP en $server/health ..."
+$attempts = 0
+while ($true) {
+    $attempts++
     try {
-        Invoke-WebRequest -Uri "$server/api/vnc/files/$f" -OutFile "$vncDir\$f" -UseBasicParsing -TimeoutSec 30
+        $null = Invoke-WebRequest -Uri "$server/health" -UseBasicParsing -TimeoutSec 8
+        Log "Servidor alcanzado en intento $attempts."
+        break
     } catch {
-        Write-Host "[IBootTime] VNC PostInstall: Error descargando ${f}: $_"
+        if ($attempts %% 10 -eq 0) { Log "Intento $attempts - aun esperando: $_" }
+        Start-Sleep -Seconds 3
     }
 }
 
-# Verify winvnc.exe exists
+# --- Download missing VNC files ---
+$files = @(%s)
+foreach ($f in $files) {
+    if (Test-Path "$vncDir\$f") {
+        Log "Archivo $f ya existe, skip."
+        continue
+    }
+    Log "Descargando $f..."
+    try {
+        Invoke-WebRequest -Uri "$server/api/vnc/files/$f" -OutFile "$vncDir\$f" -UseBasicParsing -TimeoutSec 30
+        Log "$f descargado OK."
+    } catch {
+        Log "ERROR descargando ${f}: $_"
+    }
+}
+
 if (-not (Test-Path "$vncDir\winvnc.exe")) {
-    Write-Host "[IBootTime] VNC PostInstall: winvnc.exe no descargado. Abortando."
+    Log "FATAL: winvnc.exe no existe. Abortando."
+    Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
     exit 1
 }
+Log "winvnc.exe presente OK."
 
-# --- Download ultravnc.ini ---
-Write-Host "[IBootTime] VNC PostInstall: Descargando ultravnc.ini..."
+# --- Always re-download INI ---
+Log "Descargando ultravnc.ini..."
 try {
     Invoke-WebRequest -Uri "$server/api/winpe/vnc-ini" -OutFile "$vncDir\ultravnc.ini" -UseBasicParsing -TimeoutSec 15
+    Log "ultravnc.ini OK."
 } catch {
-    Write-Host "[IBootTime] VNC PostInstall: Error descargando INI: $_"
+    Log "ERROR descargando INI: $_"
 }
 
-# --- Download password ---
 $pw = ""
 try {
     $pw = (Invoke-WebRequest -Uri "$server/api/winpe/vnc-password" -UseBasicParsing -TimeoutSec 15).Content.Trim()
+    Log "Password obtenido OK (len=$($pw.Length))."
 } catch {
-    Write-Host "[IBootTime] VNC PostInstall: Error obteniendo password: $_"
+    Log "ERROR obteniendo password: $_"
 }
 
-# --- Open firewall ---
-Write-Host "[IBootTime] VNC PostInstall: Configurando firewall..."
+# --- Firewall ---
+Log "Configurando firewall..."
+$ErrorActionPreference = "SilentlyContinue"
 netsh advfirewall set allprofiles state off 2>&1 | Out-Null
 netsh advfirewall firewall add rule name="IBootTime VNC" dir=in action=allow protocol=tcp localport=$vncPort profile=any 2>&1 | Out-Null
+netsh advfirewall firewall add rule name="IBootTime VNC Reverse" dir=out action=allow protocol=tcp remoteport=$reversePort profile=any 2>&1 | Out-Null
+$ErrorActionPreference = "Stop"
+Log "Firewall configurado."
 
-# --- Start VNC server ---
-Write-Host "[IBootTime] VNC PostInstall: Iniciando winvnc.exe..."
+# --- Helper: (re)start winvnc with reverse connection in ONE command ---
+function Start-VNC-Reverse {
+    Log "Matando winvnc existente..."
+    Get-Process winvnc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Log "Iniciando winvnc.exe -autoreconnect -connect ${serverIP}:${reversePort} -run ..."
+    Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-autoreconnect -connect ${serverIP}:${reversePort} -run" -WorkingDirectory $vncDir -WindowStyle Hidden
+    Start-Sleep -Seconds 5
+    $proc = Get-Process winvnc -ErrorAction SilentlyContinue
+    if ($proc) {
+        Log "winvnc.exe corriendo (PID=$($proc.Id))."
+    } else {
+        Log "WARNING: winvnc.exe NO aparece en procesos!"
+    }
+}
+
 Set-Location $vncDir
-Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-run" -WorkingDirectory $vncDir -WindowStyle Hidden
-Start-Sleep -Seconds 5
 
 # --- Get our IP ---
 $myIP = $null
-$adapters = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+$adapters = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
     $_.IPAddress -ne "127.0.0.1" -and $_.PrefixOrigin -ne "WellKnown"
 }
 if ($adapters) {
     $myIP = ($adapters | Select-Object -First 1).IPAddress
 }
 if (-not $myIP) {
-    # Fallback: parse ipconfig
     $ipconfig = ipconfig | Select-String "IPv4" | ForEach-Object { ($_ -split ":\s*")[1].Trim() } | Where-Object { $_ -ne "127.0.0.1" } | Select-Object -First 1
     $myIP = $ipconfig
 }
 if (-not $myIP) {
-    Write-Host "[IBootTime] VNC PostInstall: No se pudo obtener IP. Abortando."
+    Log "FATAL: No se pudo obtener IP. Abortando."
+    Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
     exit 1
 }
-Write-Host "[IBootTime] VNC PostInstall: IP del cliente: $myIP"
+Log "IP del cliente: $myIP"
 
-# --- Send beacon ---
-Write-Host "[IBootTime] VNC PostInstall: Enviando beacon..."
-$body = @{ ip = $myIP; port = $vncPort; password = $pw } | ConvertTo-Json
-try {
-    Invoke-WebRequest -Uri "$server/api/winpe/remote-ready" -Method Post -Body $body -ContentType "application/json" -UseBasicParsing -TimeoutSec 15 | Out-Null
-    Write-Host "[IBootTime] VNC PostInstall: Beacon enviado OK."
-} catch {
-    Write-Host "[IBootTime] VNC PostInstall: Beacon fallo: $_"
+# --- Beacon helper ---
+function Send-Beacon {
+    $body = @{ ip = $myIP; port = $vncPort; password = $pw } | ConvertTo-Json
+    try {
+        Invoke-WebRequest -Uri "$server/api/winpe/remote-ready" -Method Post -Body $body -ContentType "application/json" -UseBasicParsing -TimeoutSec 15 | Out-Null
+        Log "Beacon enviado OK."
+    } catch {
+        Log "Beacon FALLO: $_"
+    }
 }
 
-# --- Poll loop ---
-Write-Host "[IBootTime] VNC PostInstall: Listo en ${myIP}:${vncPort} - esperando orden del servidor..."
+# --- Start winvnc with reverse connect (single command, no IPC issue) ---
+Start-VNC-Reverse
+
+# --- Initial beacon ---
+Send-Beacon
+
+# --- Main polling loop ---
+Log "Entrando en loop de polling..."
+$lastBeacon = Get-Date
+$ErrorActionPreference = "SilentlyContinue"
 while ($true) {
+    if (((Get-Date) - $lastBeacon).TotalSeconds -ge 60) {
+        Send-Beacon
+        $lastBeacon = Get-Date
+        if (-not (Get-Process winvnc -ErrorAction SilentlyContinue)) {
+            Log "winvnc.exe murio, reiniciando con -connect..."
+            Start-VNC-Reverse
+        }
+    }
     try {
         $response = (Invoke-WebRequest -Uri "$server/api/winpe/vnc-check?ip=$myIP" -UseBasicParsing -TimeoutSec 10).Content
         if ($response -match '"connect"\s*:\s*true') {
-            Write-Host "[IBootTime] VNC PostInstall: Servidor solicito conexion! Conectando..."
-            Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-connect ${serverIP}:${reversePort}" -WorkingDirectory $vncDir -WindowStyle Hidden
-            Write-Host "[IBootTime] VNC PostInstall: Conexion reversa iniciada."
-            Start-Sleep -Seconds 3
+            Log "Servidor solicito reconexion! Reiniciando winvnc..."
+            Start-VNC-Reverse
+            Log "Reconexion completada."
         }
-    } catch {
-        # Server not reachable, will retry
-    }
+    } catch {}
     Start-Sleep -Seconds 5
 }
 `, s.serverIP, s.port, vncPort, DefaultReverseVNCPort, fileList)
+}
+
+func (s *Server) buildSetupCompleteCMD() string {
+	return "@echo off\r\n" +
+		"reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"IBootTime VNC\" /t REG_SZ /d \"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\" /f >nul 2>&1\r\n" +
+		"start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\r\n" +
+		"exit /b 0\r\n"
+}
+
+func (s *Server) buildPostInstallBootstrapCMD() string {
+	// This script runs in background in WinPE while Windows Setup installs.
+	// It continuously scans for the target Windows partition and deploys
+	// SetupComplete.cmd + VNC files. Key design decisions:
+	// - NEVER exits: keeps polling until WinPE reboots (handles format+reinstall)
+	// - Polls every 3 seconds for fast detection
+	// - Nested if blocks for reliable batch parsing
+	// - Verifies deployment succeeded before moving on
+	return "@echo off\r\n" +
+		"setlocal EnableExtensions\r\n" +
+		"echo [IBootTime] PostInstall Watcher: Iniciado\r\n" +
+		"echo [IBootTime] PostInstall Watcher: Esperando particion Windows...\r\n" +
+		":scan\r\n" +
+		"for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (\r\n" +
+		"  if /I not \"%%D\"==\"X\" (\r\n" +
+		"    if exist \"%%D:\\Windows\\System32\\config\\SYSTEM\" (\r\n" +
+		"      if not exist \"%%D:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" (\r\n" +
+		"        echo [IBootTime] PostInstall Watcher: Particion detectada en %%D:\r\n" +
+		"        call :deploy %%D\r\n" +
+		"      )\r\n" +
+		"    )\r\n" +
+		"  )\r\n" +
+		")\r\n" +
+		"ping -n 3 127.0.0.1 >nul\r\n" +
+		"goto scan\r\n" +
+		":deploy\r\n" +
+		"set TARGET=%1\r\n" +
+		"echo [IBootTime] PostInstall Watcher: Desplegando en %TARGET%: ...\r\n" +
+		"mkdir \"%TARGET%:\\IBootTime\\vnc\" >nul 2>&1\r\n" +
+		"mkdir \"%TARGET%:\\Windows\\Setup\\Scripts\" >nul 2>&1\r\n" +
+		"xcopy \"X:\\IBootTime\\vnc\\*\" \"%TARGET%:\\IBootTime\\vnc\\\" /E /I /Y /Q >nul 2>&1\r\n" +
+		"(\r\n" +
+		"echo @echo off\r\n" +
+		"echo reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"IBootTime VNC\" /t REG_SZ /d \"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\" /f ^>nul 2^>^&1\r\n" +
+		"echo start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\r\n" +
+		"echo exit /b 0\r\n" +
+		") > \"%TARGET%:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\"\r\n" +
+		"if exist \"%TARGET%:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" (\r\n" +
+		"  echo [IBootTime] PostInstall Watcher: SetupComplete.cmd creado en %TARGET%: OK\r\n" +
+		") else (\r\n" +
+		"  echo [IBootTime] PostInstall Watcher: FALLO creando SetupComplete.cmd en %TARGET%:\r\n" +
+		")\r\n" +
+		"goto :eof\r\n"
 }

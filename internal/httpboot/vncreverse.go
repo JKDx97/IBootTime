@@ -168,6 +168,18 @@ func (r *ReverseVNCListener) WaitForConn(ip string, timeout time.Duration) net.C
 	}
 }
 
+// DropConn closes and removes any stored connection for the IP.
+// Used to flush stale connections before waiting for a fresh one.
+func (r *ReverseVNCListener) DropConn(ip string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if c, ok := r.conns[ip]; ok {
+		c.Close()
+		delete(r.conns, ip)
+		r.log.Info("VNC", "Dropped stale reverse conn for %s", ip)
+	}
+}
+
 // HasConn reports whether a reverse conn is currently stored for the IP.
 func (r *ReverseVNCListener) HasConn(ip string) bool {
 	r.mu.Lock()

@@ -43,16 +43,25 @@ func (s *Server) TriggerRemote(ip string) error {
 	if ip == "" {
 		return fmt.Errorf("ip is required")
 	}
+
+	// Check session — if it doesn't exist but a reverse connection is available,
+	// create the session on-the-fly so the proxy can work.
 	sess := s.sessions.GetByIP(ip)
 	if sess == nil {
-		return fmt.Errorf("no client session for IP %s", ip)
+		if s.reverseVNC != nil && s.reverseVNC.HasConn(ip) {
+			s.sessions.SetRemoteReady(ip, 0, "")
+			s.log.Info("VNC", "Auto-created session for %s (has reverse conn)", ip)
+		} else {
+			return fmt.Errorf("no client session for IP %s", ip)
+		}
+	} else if !sess.RemoteAvailable {
+		// Also accept if a reverse connection exists even if beacon hasn't arrived
+		if s.reverseVNC == nil || !s.reverseVNC.HasConn(ip) {
+			return fmt.Errorf("client %s has not reported VNC readiness yet", ip)
+		}
+		s.sessions.SetRemoteReady(ip, 0, "")
 	}
-	if !sess.RemoteAvailable {
-		return fmt.Errorf("client %s has not reported VNC readiness yet", ip)
-	}
-	// If a reverse connection already exists (old auto-connect WIM or
-	// previous trigger), keep it — handleVNCProxy will use it directly.
-	// Only set the trigger flag so new-style polling clients also connect.
+
 	vncTriggers.Set(ip)
 	if s.reverseVNC != nil && s.reverseVNC.HasConn(ip) {
 		s.log.Info("VNC", "Trigger set for %s — reverse connection already available", ip)

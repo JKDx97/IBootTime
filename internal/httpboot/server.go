@@ -169,7 +169,7 @@ func (s *Server) Stop() {
 // Batches all removals into a single PowerShell call.
 func (s *Server) cleanupSMBShares() {
 	var names []string
-	s.smbShares.Range(func(key, value interface{}) bool {
+	s.smbShares.Range(func(key, value any) bool {
 		names = append(names, key.(string))
 		s.smbShares.Delete(key)
 		return true
@@ -187,11 +187,11 @@ func (s *Server) cleanupSMBShares() {
 
 const smbUser = "Administrador"
 const smbPass = "P0s31d0n"
-const cacheVersion = "v29-dynamic-cache"
+const cacheVersion = "v37-registry-run-vnc"
 
 // safeNetDriveLetters lists drive letters safe for net use in WinPE.
 // Avoids: A/B (floppy), C (system), D (common CD/HDD), E (common),
-// X (WinPE RAM disk), and keeps commonly used letters free.
+// F (common USB), X (WinPE RAM disk), Y/Z (we use these for SMB shares)
 var safeNetDriveLetters = []string{
 	"Z", "Y", "W", "V", "U", "T", "S", "R", "Q", "P", "O", "N", "M", "L", "K", "J", "I", "H", "G", "F",
 }
@@ -334,7 +334,7 @@ func (s *Server) shareAllISOs() {
 
 func (s *Server) countShares() int {
 	count := 0
-	s.smbShares.Range(func(_, _ interface{}) bool { count++; return true })
+	s.smbShares.Range(func(_, _ any) bool { count++; return true })
 	return count
 }
 
@@ -659,9 +659,13 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 				if err := s.injectVNCIntoWIM(idxMountDir, s.serverIP, s.port, vncPort); err != nil {
 					s.log.Warn("HTTP", "VNC injection index %d (non-fatal): %v", idx, err)
 				} else {
-					// Insert VNC call BEFORE :retry (after server reachable, before net use/setup)
-					// Uses "start /B cmd /c" so VNC runs in background without blocking setup
+					bootstrapLine := "\r\n:: IBootTime Persistent Reverse VNC Bootstrap\r\nstart \"\" /B cmd /c X:\\IBootTime\\vnc\\install_post_vnc.cmd\r\n\r\n"
 					vncLine := "\r\n:: IBootTime VNC Remote Control\r\nstart \"\" /B cmd /c X:\\IBootTime\\vnc\\start_vnc.cmd\r\n\r\n"
+					if strings.Contains(startnetContent, "echo [IBootTime] Servidor alcanzado.\r\n") {
+						startnetContent = strings.Replace(startnetContent, "echo [IBootTime] Servidor alcanzado.\r\n", "echo [IBootTime] Servidor alcanzado.\r\n"+bootstrapLine, 1)
+					} else if strings.Contains(startnetContent, "echo [IBootTime] Servidor alcanzado. Conectando") {
+						startnetContent = strings.Replace(startnetContent, "echo [IBootTime] Servidor alcanzado. Conectando", bootstrapLine+"echo [IBootTime] Servidor alcanzado. Conectando", 1)
+					}
 					if strings.Contains(startnetContent, ":retry\r\n") {
 						startnetContent = strings.Replace(startnetContent, ":retry\r\n", vncLine+":retry\r\n", 1)
 					} else {
