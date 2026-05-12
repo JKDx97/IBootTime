@@ -5,7 +5,6 @@ import IsoManager from './components/IsoManager'
 import ClientMonitor from './components/ClientMonitor'
 import NetworkConfig from './components/NetworkConfig'
 import RemoteControl from './components/RemoteControl'
-import RemoteAgents from './components/RemoteAgents'
 
 function App() {
   const [activeView, setActiveView] = useState('dashboard')
@@ -22,8 +21,6 @@ function App() {
         return <NetworkConfig />
       case 'remote':
         return <RemoteControl />
-      case 'agents':
-        return <RemoteAgents />
       default:
         return <Dashboard />
     }

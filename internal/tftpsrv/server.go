@@ -96,13 +96,26 @@ func (s *Server) readHandler(filename string, rf io.ReaderFrom) error {
 
 	s.log.Info("TFTP", "Request from %s for file: %s", clientIP, filename)
 
+	filename = strings.ReplaceAll(filename, "\\", "/")
 	filename = strings.TrimPrefix(filename, "/")
-
-	switch filename {
+	filenameLower := strings.ToLower(filename)
+	
+	// Some UEFI PXE clients request files in uppercase (e.g. BOOTX64.EFI or MMX64.EFI)
+	switch filenameLower {
 	case "undionly.kpxe", "ipxe.efi", "snp.efi":
-		return s.serveEmbeddedBinary(filename, rf)
+		return s.serveEmbeddedBinary(filenameLower, rf)
+	case "shimx64.efi", "mmx64.efi", "enroll_this_key_in_mokmanager.cer":
+		// Map back to exact case for the CER file since the asset is uppercase
+		if filenameLower == "enroll_this_key_in_mokmanager.cer" {
+			return s.serveEmbeddedBinary("ENROLL_THIS_KEY_IN_MOKMANAGER.cer", rf)
+		}
+		return s.serveEmbeddedBinary(filenameLower, rf)
 	case "grubx64.efi", "grub2pxe":
-		return s.serveEmbeddedBinary(filename, rf)
+		if filenameLower == "grubx64.efi" && s.cfg.GetBootProtocol() == config.BootProtocolSecureBootEnroll {
+			s.log.Info("TFTP", "Intercepting grubx64.efi for SecureBoot Enroll: serving mmx64.efi instead")
+			return s.serveEmbeddedBinary("mmx64.efi", rf)
+		}
+		return s.serveEmbeddedBinary(filenameLower, rf)
 	case "grub.cfg", "grub/grub.cfg":
 		return s.serveGRUBConfig(rf)
 	case "boot.ipxe", "autoboot.ipxe":
@@ -123,8 +136,9 @@ func (s *Server) serveEmbeddedBinary(filename string, rf io.ReaderFrom) error {
 	}
 
 	// Detect placeholder files (< 1KB) and fallback to ipxe.efi for UEFI binaries.
+	// shimx64.efi MUST be the real Fedora shim — do NOT fall back to ipxe.efi for it.
 	// snp.efi may be a placeholder — ipxe.efi works on most real UEFI hardware.
-	if len(data) < 1024 && filename != "undionly.kpxe" {
+	if len(data) < 1024 && filename != "undionly.kpxe" && filename != "shimx64.efi" {
 		s.log.Warn("TFTP", "%s is a placeholder (%d bytes), falling back to ipxe.efi", filename, len(data))
 		fallback, fbErr := ipxeAssets.ReadFile("assets/ipxe.efi")
 		if fbErr == nil && len(fallback) > 1024 {
@@ -133,6 +147,8 @@ func (s *Server) serveEmbeddedBinary(filename string, rf io.ReaderFrom) error {
 		} else {
 			s.log.Error("TFTP", "Fallback ipxe.efi also unavailable — PXE boot will fail on real hardware")
 		}
+	} else if len(data) < 1024 && filename == "shimx64.efi" {
+		s.log.Error("TFTP", "shimx64.efi is missing or too small (%d bytes). Download it from: https://github.com/rhboot/shim/releases or extract from a Fedora/Ubuntu ISO.", len(data))
 	}
 
 	reader := bytes.NewReader(data)
@@ -238,9 +254,19 @@ func (s *Server) serveIPXEScript(rf io.ReaderFrom) error {
 	// Menu (TFTP fallback)
 	script.WriteString(":start\n")
 	script.WriteString("menu IBootTime - Network Boot Server [${server-ip}]\n")
-	script.WriteString("item --gap --             ========================================\n")
-	script.WriteString("item --gap --                    Sistema de Boot por Red\n")
-	script.WriteString("item --gap --             ========================================\n")
+	
+	logo := []string{
+		"",
+		"  ###  TIMELESS  SUPPORT  ###",
+		"",
+		"  ============================================",
+		"           Sistema de Boot por Red",
+		"  ============================================",
+	}
+
+	for _, line := range logo {
+		script.WriteString(fmt.Sprintf("item --gap -- %s\n", line))
+	}
 
 	if len(isos) > 0 {
 		script.WriteString("item --gap --\n")

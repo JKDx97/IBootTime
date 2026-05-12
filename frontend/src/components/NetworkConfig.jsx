@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Network, Save, FolderOpen, Cpu, Terminal, Layers, Wifi, ScreenShare } from 'lucide-react'
+import { Network, Save, FolderOpen, Cpu, Terminal, Layers, Wifi, ScreenShare, ShieldCheck } from 'lucide-react'
 import {
   GetNetworkInterfaces,
   GetSelectedInterface,
@@ -38,6 +38,22 @@ const bootProtocols = [
     description: 'Sirve solo el binario iPXE sin menú. El cliente obtiene un shell iPXE para booteo manual. Para diagnóstico.',
     badge: 'Debug',
   },
+  {
+    id: 'secureboot',
+    name: 'Secure Boot (Normal)',
+    icon: ShieldCheck,
+    color: 'blue',
+    description: 'Arranque UEFI usando el shim de Fedora e iPXE firmado. Utilízalo después de haber enrolado el certificado.',
+    badge: 'Seguro',
+  },
+  {
+    id: 'secureboot-enroll',
+    name: 'Secure Boot (Enrolar)',
+    icon: ShieldCheck,
+    color: 'emerald',
+    description: 'Abre la pantalla azul MokManager para inscribir el certificado de IBootTime en la BIOS. Úsalo la primera vez.',
+    badge: 'Setup',
+  },
 ]
 
 const colorClasses = {
@@ -58,6 +74,12 @@ const colorClasses = {
     badge: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
     icon: 'text-purple-400',
     glow: 'shadow-[0_0_20px_rgba(168,85,247,0.15)]',
+  },
+  emerald: {
+    active: 'bg-emerald-500/15 border-emerald-500/50 ring-2 ring-emerald-500/30',
+    badge: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+    icon: 'text-emerald-400',
+    glow: 'shadow-[0_0_20px_rgba(16,185,129,0.15)]',
   },
 }
 
@@ -129,7 +151,7 @@ export default function NetworkConfig() {
           <span className="ml-auto text-xs text-slate-500">Selecciona cómo bootean los clientes</span>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {bootProtocols.map((proto) => {
             const Icon = proto.icon
             const isActive = bootProtocol === proto.id

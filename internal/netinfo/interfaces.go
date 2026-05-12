@@ -3,8 +3,9 @@ package netinfo
 import (
 	"fmt"
 	"net"
-	"os/exec"
 	"strings"
+
+	"IBootTime/internal/hidecmd"
 )
 
 type NetInterface struct {
@@ -76,7 +77,7 @@ func GetInterfaceIP(name string) (string, error) {
 // Falls back to serverIP's .1 if detection fails.
 func GetDefaultGateway(serverIP string) string {
 	// Try PowerShell (Windows 10+)
-	out, err := exec.Command("powershell", "-NoProfile", "-Command",
+	out, err := hidecmd.Command("powershell", "-NoProfile", "-Command",
 		"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop",
 	).Output()
 	if err == nil {

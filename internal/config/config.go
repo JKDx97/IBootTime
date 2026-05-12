@@ -10,9 +10,11 @@ import (
 type BootProtocol string
 
 const (
-	BootProtocolIPXE    BootProtocol = "ipxe"
-	BootProtocolGRUB    BootProtocol = "grub"
-	BootProtocolUndionly BootProtocol = "undionly"
+	BootProtocolIPXE       BootProtocol = "ipxe"
+	BootProtocolGRUB             BootProtocol = "grub"
+	BootProtocolUndionly         BootProtocol = "undionly"
+	BootProtocolSecureBoot       BootProtocol = "secureboot"
+	BootProtocolSecureBootEnroll BootProtocol = "secureboot-enroll"
 )
 
 type Config struct {
@@ -24,6 +26,7 @@ type Config struct {
 	BootProtocol  BootProtocol `json:"bootProtocol"`
 	WinPERemote   bool         `json:"winpeRemote"`
 	WinPEVncPort  int          `json:"winpeVncPort"`
+	SecureBoot    bool         `json:"secureBoot"`  // Serve shimx64.efi for UEFI clients (Secure Boot compatible)
 	DisabledISOs  []string            `json:"disabledISOs,omitempty"`
 	ISOUnattend   map[string]string   `json:"isoUnattend,omitempty"`
 	configPath    string
@@ -115,6 +118,12 @@ func (c *Config) GetWinPEVncPort() int {
 		return 5900
 	}
 	return c.WinPEVncPort
+}
+
+func (c *Config) GetSecureBoot() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.SecureBoot || c.BootProtocol == BootProtocolSecureBoot || c.BootProtocol == BootProtocolSecureBootEnroll
 }
 
 func (c *Config) GetDisabledISOs() []string {

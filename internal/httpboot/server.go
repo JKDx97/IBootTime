@@ -426,9 +426,15 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 
 	// Version marker — includes server IP, port, and VNC config so WIM is
 	// rebuilt automatically whenever the network environment changes.
-	fullVersion := fmt.Sprintf("%s|ip=%s|port=%d|vnc=%v|vncport=%d|user=%s",
+	driverTag := "nodrivers"
+	if dDir := s.findDriversDir(); dDir != "" {
+		if entries, _ := os.ReadDir(dDir); len(entries) > 0 {
+			driverTag = fmt.Sprintf("drivers:%d", len(entries))
+		}
+	}
+	fullVersion := fmt.Sprintf("%s|ip=%s|port=%d|vnc=%v|vncport=%d|user=%s|%s",
 		cacheVersion, s.serverIP, s.port,
-		s.cfg.GetWinPERemote(), s.cfg.GetWinPEVncPort(), smbUser)
+		s.cfg.GetWinPERemote(), s.cfg.GetWinPEVncPort(), smbUser, driverTag)
 	versionFile := filepath.Join(cacheDir, ".version")
 	if versionData, err := os.ReadFile(versionFile); err == nil && string(versionData) == fullVersion {
 		// version matches — keep existing rebuild decision
@@ -765,7 +771,11 @@ func (s *Server) findDriversDir() string {
 	for _, dir := range candidates {
 		absDir, _ := filepath.Abs(dir)
 		if info, err := os.Stat(absDir); err == nil && info.IsDir() {
-			return absDir
+			// Verify it actually contains files (not just empty subdirs)
+			entries, _ := os.ReadDir(absDir)
+			if len(entries) > 0 {
+				return absDir
+			}
 		}
 	}
 	return ""
@@ -858,9 +868,19 @@ func (s *Server) handleBootScript(w http.ResponseWriter, r *http.Request) {
 	// Menu
 	script.WriteString(":start\n")
 	script.WriteString("menu IBootTime - Network Boot Server [${server-ip}]\n")
-	script.WriteString("item --gap --             ========================================\n")
-	script.WriteString("item --gap --                    Sistema de Boot por Red\n")
-	script.WriteString("item --gap --             ========================================\n")
+	
+	logo := []string{
+		"",
+		"  ###  TIMELESS  SUPPORT  ###",
+		"",
+		"  ============================================",
+		"           Sistema de Boot por Red",
+		"  ============================================",
+	}
+
+	for _, line := range logo {
+		script.WriteString(fmt.Sprintf("item --gap -- %s\n", line))
+	}
 
 	if len(isos) > 0 {
 		script.WriteString("item --gap --\n")

@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"IBootTime/internal/hidecmd"
 )
 
 // Proxy forwards requests from Wails frontend to the Python agent server.
@@ -56,7 +58,7 @@ func (p *Proxy) Start() error {
 		pythonBin = "python3"
 	}
 
-	p.cmd = exec.Command(pythonBin, script)
+	p.cmd = hidecmd.Command(pythonBin, script)
 	p.cmd.Dir = p.scriptDir
 	p.cmd.Stdout = os.Stdout
 	p.cmd.Stderr = os.Stderr
@@ -90,7 +92,7 @@ func (p *Proxy) Stop() {
 
 	if runtime.GOOS == "windows" {
 		// On Windows, kill the process tree
-		kill := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", p.cmd.Process.Pid))
+		kill := hidecmd.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", p.cmd.Process.Pid))
 		kill.Run()
 	} else {
 		p.cmd.Process.Signal(os.Interrupt)

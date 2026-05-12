@@ -2,6 +2,8 @@ package main
 
 import (
 	"embed"
+	"os"
+	"path/filepath"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -13,6 +15,11 @@ import (
 var assets embed.FS
 
 func main() {
+	// Extract embedded resources (VNC, noVNC, agent_server) for portable mode
+	if exe, err := os.Executable(); err == nil {
+		extractEmbeddedResources(filepath.Dir(exe))
+	}
+
 	app := NewApp()
 
 	err := wails.Run(&options.App{

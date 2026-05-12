@@ -87,14 +87,15 @@ func (r *ReverseVNCListener) acceptLoop() {
 	for {
 		conn, err := r.listener.Accept()
 		if err != nil {
-			// Listener was closed.
+			// Listener was closed — exit cleanly.
 			if strings.Contains(err.Error(), "use of closed") {
 				return
 			}
-			r.log.Warn("VNC", "Reverse accept error: %v", err)
-			return
+			// Transient error — log and keep looping (don't exit).
+			r.log.Warn("VNC", "Reverse accept error (retrying): %v", err)
+			continue
 		}
-		r.handleNewConn(conn)
+		go r.handleNewConn(conn)
 	}
 }
 
@@ -122,6 +123,14 @@ func (r *ReverseVNCListener) handleNewConn(conn net.Conn) {
 		// use the stored conn instead of dialing.
 		r.sessions.SetRemoteReady(ip, 0, "")
 	}
+}
+
+// handleNewConn2 re-stores a connection that was taken out of the pool.
+// Used by handleVNCProxy when it needs to put it back after waiting.
+func (r *ReverseVNCListener) handleNewConn2(ip string, conn net.Conn) {
+	r.mu.Lock()
+	r.conns[ip] = conn
+	r.mu.Unlock()
 }
 
 // TakeConn removes and returns the stored connection for the given IP, if any.

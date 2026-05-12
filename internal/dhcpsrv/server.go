@@ -600,19 +600,45 @@ func (s *Server) sendBootResponse(msgType byte, origData, xid []byte, mac, arch 
 func (s *Server) getBootFilename(arch string, isIPXE, hasHTTP bool) string {
 	bootProto := s.cfg.GetBootProtocol()
 
+	// ── Secure Boot mode ────────────────────────────────────────────────────
+	// When SecureBoot is enabled in config, serve shimx64.efi for ALL UEFI
+	// clients that are not already running iPXE.
+	// shimx64.efi is signed by Microsoft (Fedora Shim), so it passes Secure
+	// Boot validation without enrolling any custom keys.
+	// The shim then chainloads ipxe.efi (also on our TFTP server).
+	if s.cfg.GetSecureBoot() && strings.Contains(arch, "UEFI") && !isIPXE {
+		s.log.Info("DHCP", "  SecureBoot mode (UEFI %s) shimx64.efi (via TFTP)", arch)
+		return "shimx64.efi"
+	}
+
 	switch bootProto {
+	case config.BootProtocolSecureBoot, config.BootProtocolSecureBootEnroll:
+		// SecureBoot protocol: iPXE or BIOS fallback
+		if isIPXE && hasHTTP {
+			url := fmt.Sprintf("http://%s:%d/boot.ipxe", s.serverIP.String(), s.cfg.HTTPPort)
+			s.log.Info("DHCP", "  SecureBoot + iPXE+HTTP boot script: %s", url)
+			return url
+		}
+		if isIPXE {
+			s.log.Info("DHCP", "  SecureBoot + iPXE boot.ipxe (TFTP)")
+			return "boot.ipxe"
+		}
+		// BIOS client in secureboot mode: legacy loader
+		s.log.Info("DHCP", "  SecureBoot mode (BIOS) undionly.kpxe (TFTP)")
+		return "undionly.kpxe"
+
 	case config.BootProtocolGRUB:
 		if isIPXE && hasHTTP {
 			url := fmt.Sprintf("http://%s:%d/boot.ipxe", s.serverIP.String(), s.cfg.HTTPPort)
-			s.log.Info("DHCP", "  GRUB mode + iPXE+HTTP → fallback iPXE script: %s", url)
+			s.log.Info("DHCP", "  GRUB mode + iPXE+HTTP fallback iPXE script: %s", url)
 			return url
 		}
 		switch {
 		case strings.Contains(arch, "UEFI"):
-			s.log.Info("DHCP", "  GRUB mode (UEFI %s) → grubx64.efi (via TFTP)", arch)
+			s.log.Info("DHCP", "  GRUB mode (UEFI %s) grubx64.efi (via TFTP)", arch)
 			return "grubx64.efi"
 		default:
-			s.log.Info("DHCP", "  GRUB mode (BIOS) → grub2pxe (via TFTP)")
+			s.log.Info("DHCP", "  GRUB mode (BIOS) grub2pxe (via TFTP)")
 			return "grub2pxe"
 		}
 
@@ -620,18 +646,18 @@ func (s *Server) getBootFilename(arch string, isIPXE, hasHTTP bool) string {
 		if isIPXE {
 			if hasHTTP {
 				url := fmt.Sprintf("http://%s:%d/boot.ipxe", s.serverIP.String(), s.cfg.HTTPPort)
-				s.log.Info("DHCP", "  Undionly mode + iPXE+HTTP → shell script: %s", url)
+				s.log.Info("DHCP", "  Undionly mode + iPXE+HTTP shell script: %s", url)
 				return url
 			}
-			s.log.Info("DHCP", "  Undionly mode + iPXE → boot.ipxe (via TFTP, shell only)")
+			s.log.Info("DHCP", "  Undionly mode + iPXE boot.ipxe (via TFTP, shell only)")
 			return "boot.ipxe"
 		}
 		switch {
 		case strings.Contains(arch, "UEFI"):
-			s.log.Info("DHCP", "  Undionly mode (UEFI %s) → snp.efi (via TFTP)", arch)
+			s.log.Info("DHCP", "  Undionly mode (UEFI %s) snp.efi (via TFTP)", arch)
 			return "snp.efi"
 		default:
-			s.log.Info("DHCP", "  Undionly mode (BIOS) → undionly.kpxe (via TFTP)")
+			s.log.Info("DHCP", "  Undionly mode (BIOS) undionly.kpxe (via TFTP)")
 			return "undionly.kpxe"
 		}
 
