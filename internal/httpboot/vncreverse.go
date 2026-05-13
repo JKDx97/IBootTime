@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"IBootTime/internal/hidecmd"
 	"IBootTime/internal/logger"
 	"IBootTime/internal/session"
 )
@@ -48,6 +49,9 @@ func NewReverseVNCListener(port int, log *logger.Logger, sessions *session.Manag
 // Start binds the listener and begins accepting connections in a goroutine.
 // It returns immediately.
 func (r *ReverseVNCListener) Start(ctx context.Context) error {
+	// Open Windows Firewall for reverse VNC port so clients can dial in.
+	r.openFirewall()
+
 	addr := fmt.Sprintf(":%d", r.port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -203,4 +207,22 @@ func remoteIP(c net.Conn) string {
 		return host
 	}
 	return addr
+}
+
+// openFirewall adds a Windows Firewall inbound rule for the reverse VNC port.
+func (r *ReverseVNCListener) openFirewall() {
+	portStr := fmt.Sprintf("%d", r.port)
+	// Delete old rule first (ignore errors if it doesn't exist)
+	hidecmd.Command("netsh", "advfirewall", "firewall", "delete", "rule",
+		"name=IBootTime Reverse VNC").Run()
+	// Add inbound rule
+	cmd := hidecmd.Command("netsh", "advfirewall", "firewall", "add", "rule",
+		"name=IBootTime Reverse VNC",
+		"dir=in", "action=allow", "protocol=tcp",
+		"localport="+portStr, "profile=any")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		r.log.Warn("VNC", "Failed to add firewall rule for port %s: %v (%s)", portStr, err, strings.TrimSpace(string(out)))
+	} else {
+		r.log.Info("VNC", "Firewall rule added for reverse VNC port %s", portStr)
+	}
 }

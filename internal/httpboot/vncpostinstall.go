@@ -243,48 +243,22 @@ netsh advfirewall firewall add rule name="IBootTime VNC Reverse" dir=out action=
 $ErrorActionPreference = "Stop"
 Log "Firewall configurado."
 
-# --- Helper: install winvnc as service (hides tray icon) and start with reverse connection ---
-$global:svcInstalled = $false
-function Install-VNC-Service {
-    if ($global:svcInstalled) { return }
-    Log "Instalando winvnc como servicio..."
-    $p = Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-install" -WorkingDirectory $vncDir -WindowStyle Hidden -Wait -PassThru
-    Start-Sleep -Seconds 2
-    # Verify service exists
-    $svc = Get-Service -Name "uvnc_service" -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        # Some UltraVNC versions register as "winvnc"
-        $svc = Get-Service -Name "winvnc" -ErrorAction SilentlyContinue
-    }
-    if ($svc) {
-        Log "Servicio VNC instalado OK: $($svc.Name)"
-        $global:svcInstalled = $true
-    } else {
-        Log "WARNING: No se detecto servicio VNC tras -install. Usando modo app como fallback."
-    }
-}
-
+# --- Helper: start winvnc in app mode with reverse connection ---
+# NOTE: Service mode (winvnc -install) runs in session 0 which is isolated
+# from the interactive desktop on Windows Vista+. App mode (-run) runs in the
+# user's session and CAN capture the desktop for remote control.
 function Start-VNC-Reverse {
     Log "Deteniendo winvnc existente..."
     Get-Process winvnc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Also stop service if it was previously installed
+    $ErrorActionPreference = "SilentlyContinue"
+    Stop-Service -Name "uvnc_service" -Force 2>&1 | Out-Null
+    Stop-Service -Name "winvnc" -Force 2>&1 | Out-Null
+    $ErrorActionPreference = "Stop"
     Start-Sleep -Seconds 2
 
-    Install-VNC-Service
-
-    if ($global:svcInstalled) {
-        # Start via service — DisableTrayIcon=1 is honored, no tray icon
-        $svcName = if (Get-Service -Name "uvnc_service" -ErrorAction SilentlyContinue) { "uvnc_service" } else { "winvnc" }
-        Log "Iniciando servicio $svcName..."
-        Start-Service -Name $svcName -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
-        # Trigger reverse connection
-        Log "Disparando conexion reversa a ${serverIP}:${reversePort}..."
-        Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-autoreconnect -connect ${serverIP}:${reversePort}" -WorkingDirectory $vncDir -WindowStyle Hidden
-    } else {
-        # Fallback: run as app (tray icon may appear)
-        Log "Iniciando winvnc.exe -autoreconnect -connect ${serverIP}:${reversePort} -run (fallback)..."
-        Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-autoreconnect -connect ${serverIP}:${reversePort} -run" -WorkingDirectory $vncDir -WindowStyle Hidden
-    }
+    Log "Iniciando winvnc.exe -autoreconnect -connect ${serverIP}:${reversePort} -run ..."
+    Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-autoreconnect -connect ${serverIP}:${reversePort} -run" -WorkingDirectory $vncDir -WindowStyle Hidden
     Start-Sleep -Seconds 5
     $proc = Get-Process winvnc -ErrorAction SilentlyContinue
     if ($proc) {

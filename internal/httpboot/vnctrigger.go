@@ -62,12 +62,15 @@ func (s *Server) TriggerRemote(ip string) error {
 		s.sessions.SetRemoteReady(ip, 0, "")
 	}
 
-	vncTriggers.Set(ip)
-	if s.reverseVNC != nil && s.reverseVNC.HasConn(ip) {
-		s.log.Info("VNC", "Trigger set for %s — reverse connection already available", ip)
-	} else {
-		s.log.Info("VNC", "Trigger set for %s — waiting for client to dial in", ip)
+	// Drop any stale stored connection so the client creates a FRESH one.
+	// The VNC RFB handshake times out if nobody reads within ~30s, so old
+	// connections are likely dead by the time the user clicks "Conectar".
+	if s.reverseVNC != nil {
+		s.reverseVNC.DropConn(ip)
 	}
+
+	vncTriggers.Set(ip)
+	s.log.Info("VNC", "Trigger set for %s — waiting for fresh reverse connection from client", ip)
 	return nil
 }
 
