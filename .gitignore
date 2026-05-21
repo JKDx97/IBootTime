@@ -12,6 +12,9 @@ isos/
 # Drivers (large binary files)
 drivers/
 
+# Python embedded (downloaded via scripts/download-python-embed.ps1)
+tools/python-embed/
+
 # Runtime config (generated on first run)
 iboottime.json
 

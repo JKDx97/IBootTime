@@ -88,6 +88,7 @@ export default function ClientMonitor() {
           <table className="w-full">
             <thead>
               <tr className="border-b border-slate-700 text-xs text-slate-400 uppercase tracking-wider">
+                <th className="text-left px-4 py-3">Equipo</th>
                 <th className="text-left px-4 py-3">MAC Address</th>
                 <th className="text-left px-4 py-3">IP Address</th>
                 <th className="text-left px-4 py-3">Arch</th>
@@ -104,8 +105,9 @@ export default function ClientMonitor() {
                 const stateInfo = stateLabels[client.state] || stateLabels.discovery
                 return (
                   <tr key={client.mac} className="border-b border-slate-800 hover:bg-slate-800/50 transition-colors">
+                    <td className="px-4 py-3 text-sm font-semibold text-white">{client.hostname || '-'}</td>
                     <td className="px-4 py-3 font-mono text-sm text-slate-300">{client.mac}</td>
-                    <td className="px-4 py-3 font-mono text-sm text-white">{client.ip}</td>
+                    <td className="px-4 py-3 font-mono text-sm text-slate-400">{client.ip}</td>
                     <td className="px-4 py-3 text-sm text-slate-400">{client.arch}</td>
                     <td className="px-4 py-3">
                       <span className={clsx(

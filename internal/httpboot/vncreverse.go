@@ -125,7 +125,7 @@ func (r *ReverseVNCListener) handleNewConn(conn net.Conn) {
 	if r.sessions != nil {
 		// Port 0 means "reverse only" — handleVNCProxy will ignore it and
 		// use the stored conn instead of dialing.
-		r.sessions.SetRemoteReady(ip, 0, "")
+		r.sessions.SetRemoteReady(ip, 0, "", "")
 	}
 }
 

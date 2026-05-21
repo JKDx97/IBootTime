@@ -1,3 +1,90 @@
+export namespace agentproxy {
+	
+	export class HardwareResponse {
+	    hardware: any;
+	    diagnostics: any;
+	
+	    static createFrom(source: any = {}) {
+	        return new HardwareResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.hardware = source["hardware"];
+	        this.diagnostics = source["diagnostics"];
+	    }
+	}
+	export class RemoteClient {
+	    client_id: string;
+	    hostname: string;
+	    ip: string;
+	    os_version: string;
+	    mac: string;
+	    status: string;
+	    registered_at: number;
+	    last_seen: number;
+	    hardware: any;
+	    diagnostics: any;
+	
+	    static createFrom(source: any = {}) {
+	        return new RemoteClient(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.client_id = source["client_id"];
+	        this.hostname = source["hostname"];
+	        this.ip = source["ip"];
+	        this.os_version = source["os_version"];
+	        this.mac = source["mac"];
+	        this.status = source["status"];
+	        this.registered_at = source["registered_at"];
+	        this.last_seen = source["last_seen"];
+	        this.hardware = source["hardware"];
+	        this.diagnostics = source["diagnostics"];
+	    }
+	}
+	export class RemoteTask {
+	    task_id: string;
+	    task_type: string;
+	    params: any;
+	    status: string;
+	    result_output: string;
+	    created_at: number;
+	    completed_at: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new RemoteTask(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.task_id = source["task_id"];
+	        this.task_type = source["task_type"];
+	        this.params = source["params"];
+	        this.status = source["status"];
+	        this.result_output = source["result_output"];
+	        this.created_at = source["created_at"];
+	        this.completed_at = source["completed_at"];
+	    }
+	}
+	export class TaskResponse {
+	    task_id: string;
+	    status: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new TaskResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.task_id = source["task_id"];
+	        this.status = source["status"];
+	    }
+	}
+
+}
+
 export namespace isomgr {
 	
 	export class ISOInfo {
@@ -136,6 +223,7 @@ export namespace session {
 	export class ClientSession {
 	    mac: string;
 	    ip: string;
+	    hostname: string;
 	    arch: string;
 	    state: string;
 	    isoName: string;
@@ -160,6 +248,7 @@ export namespace session {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.mac = source["mac"];
 	        this.ip = source["ip"];
+	        this.hostname = source["hostname"];
 	        this.arch = source["arch"];
 	        this.state = source["state"];
 	        this.isoName = source["isoName"];

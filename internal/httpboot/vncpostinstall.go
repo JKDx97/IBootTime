@@ -243,28 +243,70 @@ netsh advfirewall firewall add rule name="IBootTime VNC Reverse" dir=out action=
 $ErrorActionPreference = "Stop"
 Log "Firewall configurado."
 
-# --- Helper: start winvnc in app mode with reverse connection ---
-# NOTE: Service mode (winvnc -install) runs in session 0 which is isolated
-# from the interactive desktop on Windows Vista+. App mode (-run) runs in the
-# user's session and CAN capture the desktop for remote control.
-function Start-VNC-Reverse {
-    Log "Deteniendo winvnc existente..."
-    Get-Process winvnc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    # Also stop service if it was previously installed
-    $ErrorActionPreference = "SilentlyContinue"
-    Stop-Service -Name "uvnc_service" -Force 2>&1 | Out-Null
-    Stop-Service -Name "winvnc" -Force 2>&1 | Out-Null
-    $ErrorActionPreference = "Stop"
-    Start-Sleep -Seconds 2
-
-    Log "Iniciando winvnc.exe -autoreconnect -connect ${serverIP}:${reversePort} -run ..."
-    Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-autoreconnect -connect ${serverIP}:${reversePort} -run" -WorkingDirectory $vncDir -WindowStyle Hidden
-    Start-Sleep -Seconds 5
-    $proc = Get-Process winvnc -ErrorAction SilentlyContinue
-    if ($proc) {
-        Log "winvnc.exe corriendo (PID=$($proc.Id))."
+# --- Helper: install/start VNC as Windows service + trigger reverse connect ---
+# Service mode starts at boot (before user login), DisableTrayIcon=1 is honored,
+# and UltraVNC service handles session switching to capture the interactive desktop.
+# AutoReconnect=1 in ultravnc.ini handles automatic reconnection.
+function Install-VNC-Service {
+    $svc = Get-Service -Name "uvnc_service" -ErrorAction SilentlyContinue
+    if (-not $svc) { $svc = Get-Service -Name "winvnc" -ErrorAction SilentlyContinue }
+    if (-not $svc) {
+        Log "Instalando VNC como servicio..."
+        Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-install" -WorkingDirectory $vncDir -WindowStyle Hidden -Wait
+        Start-Sleep -Seconds 2
+        $svc = Get-Service -Name "uvnc_service" -ErrorAction SilentlyContinue
+        if (-not $svc) { $svc = Get-Service -Name "winvnc" -ErrorAction SilentlyContinue }
+        if ($svc) {
+            Log "Servicio VNC instalado OK: $($svc.Name)"
+        } else {
+            Log "WARNING: No se pudo instalar servicio VNC."
+        }
     } else {
-        Log "WARNING: winvnc.exe NO aparece en procesos!"
+        Log "Servicio VNC ya instalado: $($svc.Name)"
+    }
+}
+
+function Start-VNC-Reverse {
+    Log "Preparando servicio VNC..."
+
+    # Kill any rogue app-mode processes
+    Get-Process winvnc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+
+    Install-VNC-Service
+
+    # Start the service if not running
+    $svcName = $null
+    foreach ($name in @("uvnc_service", "winvnc")) {
+        if (Get-Service -Name $name -ErrorAction SilentlyContinue) { $svcName = $name; break }
+    }
+
+    if ($svcName) {
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc.Status -ne "Running") {
+            Log "Iniciando servicio $svcName..."
+            Start-Service -Name $svcName -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+        } else {
+            Log "Servicio $svcName ya corriendo."
+        }
+
+        # Send IPC connect command to the running service (no -autoreconnect, no -run)
+        Log "Enviando -connect ${serverIP}:${reversePort} al servicio..."
+        Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-connect ${serverIP}:${reversePort}" -WorkingDirectory $vncDir -WindowStyle Hidden
+        Start-Sleep -Seconds 3
+
+        $proc = Get-Process winvnc -ErrorAction SilentlyContinue
+        if ($proc) {
+            Log "winvnc.exe corriendo (PID=$($proc.Id))."
+        } else {
+            Log "WARNING: winvnc.exe NO aparece en procesos!"
+        }
+    } else {
+        # Fallback: app mode if service install failed
+        Log "Servicio no disponible, usando modo app como fallback..."
+        Start-Process -FilePath "$vncDir\winvnc.exe" -ArgumentList "-autoreconnect -connect ${serverIP}:${reversePort} -run" -WorkingDirectory $vncDir -WindowStyle Hidden
+        Start-Sleep -Seconds 5
     }
 }
 
@@ -288,10 +330,13 @@ if (-not $myIP) {
     exit 1
 }
 Log "IP del cliente: $myIP"
+$hostname = $env:COMPUTERNAME
+if (-not $hostname) { $hostname = hostname }
+Log "Hostname: $hostname"
 
 # --- Beacon helper ---
 function Send-Beacon {
-    $body = @{ ip = $myIP; port = $vncPort; password = $pw } | ConvertTo-Json
+    $body = @{ ip = $myIP; port = $vncPort; password = $pw; hostname = $hostname } | ConvertTo-Json
     try {
         Invoke-WebRequest -Uri "$server/api/winpe/remote-ready" -Method Post -Body $body -ContentType "application/json" -UseBasicParsing -TimeoutSec 15 | Out-Null
         Log "Beacon enviado OK."
@@ -334,7 +379,11 @@ while ($true) {
 
 func (s *Server) buildSetupCompleteCMD() string {
 	return "@echo off\r\n" +
-		"reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"IBootTime VNC\" /t REG_SZ /d \"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\" /f >nul 2>&1\r\n" +
+		"REM Install VNC as Windows service (starts at boot, before login)\r\n" +
+		"C:\\IBootTime\\vnc\\winvnc.exe -install >nul 2>&1\r\n" +
+		"REM Register scheduled task for the polling/beacon script at system startup\r\n" +
+		"schtasks /create /tn \"IBootTime VNC\" /tr \"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\" /sc onstart /ru SYSTEM /rl HIGHEST /f >nul 2>&1\r\n" +
+		"REM Start the polling script now\r\n" +
 		"start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\r\n" +
 		"exit /b 0\r\n"
 }
@@ -342,7 +391,7 @@ func (s *Server) buildSetupCompleteCMD() string {
 func (s *Server) buildPostInstallBootstrapCMD() string {
 	// This script runs in background in WinPE while Windows Setup installs.
 	// It continuously scans for the target Windows partition and deploys
-	// SetupComplete.cmd + VNC files. Key design decisions:
+	// SetupComplete.cmd + VNC files + Agent files. Key design decisions:
 	// - NEVER exits: keeps polling until WinPE reboots (handles format+reinstall)
 	// - Polls every 3 seconds for fast detection
 	// - Nested if blocks for reliable batch parsing
@@ -368,12 +417,27 @@ func (s *Server) buildPostInstallBootstrapCMD() string {
 		"set TARGET=%1\r\n" +
 		"echo [IBootTime] PostInstall Watcher: Desplegando en %TARGET%: ...\r\n" +
 		"mkdir \"%TARGET%:\\IBootTime\\vnc\" >nul 2>&1\r\n" +
+		"mkdir \"%TARGET%:\\IBootTime\\agent\" >nul 2>&1\r\n" +
+		"mkdir \"%TARGET%:\\IBootTime\\python\" >nul 2>&1\r\n" +
 		"mkdir \"%TARGET%:\\Windows\\Setup\\Scripts\" >nul 2>&1\r\n" +
 		"xcopy \"X:\\IBootTime\\vnc\\*\" \"%TARGET%:\\IBootTime\\vnc\\\" /E /I /Y /Q >nul 2>&1\r\n" +
+		"echo [IBootTime] PostInstall Watcher: VNC copiado.\r\n" +
+		"if exist \"X:\\IBootTime\\agent\\client.py\" (\r\n" +
+		"  xcopy \"X:\\IBootTime\\agent\\*\" \"%TARGET%:\\IBootTime\\agent\\\" /E /I /Y /Q >nul 2>&1\r\n" +
+		"  echo [IBootTime] PostInstall Watcher: Agent copiado.\r\n" +
+		")\r\n" +
+		"if exist \"X:\\IBootTime\\python\\python.exe\" (\r\n" +
+		"  xcopy \"X:\\IBootTime\\python\\*\" \"%TARGET%:\\IBootTime\\python\\\" /E /I /Y /Q >nul 2>&1\r\n" +
+		"  echo [IBootTime] PostInstall Watcher: Python copiado.\r\n" +
+		")\r\n" +
 		"(\r\n" +
 		"echo @echo off\r\n" +
-		"echo reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"IBootTime VNC\" /t REG_SZ /d \"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\" /f ^>nul 2^>^&1\r\n" +
+		"echo REM === IBootTime SetupComplete ===\r\n" +
+		"echo C:\\IBootTime\\vnc\\winvnc.exe -install ^>nul 2^>^&1\r\n" +
+		"echo schtasks /create /tn \"IBootTime VNC\" /tr \"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\" /sc onstart /ru SYSTEM /rl HIGHEST /f ^>nul 2^>^&1\r\n" +
 		"echo start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\vnc\\postinstall_vnc.ps1\r\n" +
+		"echo REM === IBootTime Agent ===\r\n" +
+		"echo start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\IBootTime\\agent\\postinstall_agent.ps1\r\n" +
 		"echo exit /b 0\r\n" +
 		") > \"%TARGET%:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\"\r\n" +
 		"if exist \"%TARGET%:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" (\r\n" +

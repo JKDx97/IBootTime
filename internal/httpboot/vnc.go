@@ -102,6 +102,8 @@ func buildUltraVNCIni(encryptedHex string, port int) string {
 		"LoopbackOnly=0\r\n"+
 		"ConnectPriority=0\r\n"+
 		"DisableTrayIcon=1\r\n"+
+		"AutoReconnect=1\r\n"+
+		"AutoReconnectPort=5500\r\n"+
 		"MSLogonRequired=0\r\n"+
 		"NewMSLogon=0\r\n"+
 		"RemoveWallpaper=0\r\n"+
@@ -163,7 +165,7 @@ func (s *Server) handleVNCProxy(w http.ResponseWriter, r *http.Request) {
 				s.log.Info("VNC", "Using reverse connection from %s", clientHost)
 				// Auto-create session if needed
 				if s.sessions.GetByIP(clientHost) == nil {
-					s.sessions.SetRemoteReady(clientHost, 0, "")
+					s.sessions.SetRemoteReady(clientHost, 0, "", "")
 				}
 			}
 		}
@@ -257,6 +259,7 @@ func (s *Server) handleRemoteBeacon(w http.ResponseWriter, r *http.Request) {
 		IP       string `json:"ip"`
 		Port     int    `json:"port"`
 		Password string `json:"password"`
+		Hostname string `json:"hostname"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -271,8 +274,8 @@ func (s *Server) handleRemoteBeacon(w http.ResponseWriter, r *http.Request) {
 		body.Port = 5900
 	}
 
-	s.log.Info("VNC", "Remote beacon from %s (port=%d)", body.IP, body.Port)
-	s.sessions.SetRemoteReady(body.IP, body.Port, body.Password)
+	s.log.Info("VNC", "Remote beacon from %s (port=%d hostname=%s)", body.IP, body.Port, body.Hostname)
+	s.sessions.SetRemoteReady(body.IP, body.Port, body.Password, body.Hostname)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

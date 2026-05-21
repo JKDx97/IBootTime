@@ -187,7 +187,7 @@ func (s *Server) cleanupSMBShares() {
 
 const smbUser = "Administrador"
 const smbPass = "P0s31d0n"
-const cacheVersion = "v37-registry-run-vnc"
+const cacheVersion = "v40-agent-reconnect"
 
 // safeNetDriveLetters lists drive letters safe for net use in WinPE.
 // Avoids: A/B (floppy), C (system), D (common CD/HDD), E (common),
@@ -658,6 +658,13 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 
 			// -- Always inject curl.exe for autounattend.xml download --
 			s.injectCurlIntoWIM(idxMountDir)
+
+			// -- Inject Agent (Python + client) for post-install hardware monitoring --
+			if err := s.injectAgentIntoWIM(idxMountDir, s.serverIP, s.port); err != nil {
+				s.log.Warn("HTTP", "Agent injection index %d (non-fatal): %v", idx, err)
+			} else {
+				s.log.Info("HTTP", "Agent injected into index %d", idx)
+			}
 
 			// -- Inject VNC remote control (if enabled) --
 			if s.cfg.GetWinPERemote() {

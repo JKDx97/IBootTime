@@ -215,7 +215,7 @@ export default function Dashboard() {
                 {clients.map((c) => (
                   <div key={c.mac} className="flex items-center text-xs bg-slate-800 rounded-lg px-3 py-1.5 gap-2">
                     <span className="font-mono text-slate-400 w-36">{c.mac}</span>
-                    <span className="text-white w-28">{c.ip}</span>
+                    <span className="text-white w-36" title={c.ip}>{c.hostname || c.ip}</span>
                     <span className="text-blue-400 flex-1">{c.isoName || c.state}</span>
                     {c.progress > 0 && (
                       <span className="text-emerald-400 shrink-0">{c.progress.toFixed(1)}%</span>

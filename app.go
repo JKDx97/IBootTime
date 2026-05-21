@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"IBootTime/internal/agentproxy"
 	"IBootTime/internal/config"
 	"IBootTime/internal/isomgr"
 	"IBootTime/internal/logger"
@@ -24,6 +25,7 @@ type App struct {
 	isoMgr       *isomgr.Manager
 	sessions     *session.Manager
 	orchestrator *orchestrator.Orchestrator
+	agent        *agentproxy.Proxy
 }
 
 func NewApp() *App {
@@ -87,12 +89,25 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}()
 
+	// Initialize and start agent proxy (Python agent server)
+	a.agent = agentproxy.New("http://127.0.0.1:9090")
+	go func() {
+		if err := a.agent.Start(); err != nil {
+			a.log.Warn("App", "Agent server not available: %v", err)
+		} else {
+			a.log.Info("App", "Agent server started on :9090")
+		}
+	}()
+
 	a.log.Info("App", "IBootTime initialized")
 }
 
 func (a *App) shutdown(ctx context.Context) {
 	if a.orchestrator != nil && a.orchestrator.IsRunning() {
 		a.orchestrator.StopAll()
+	}
+	if a.agent != nil {
+		a.agent.Stop()
 	}
 }
 
@@ -273,6 +288,40 @@ func (a *App) ClearISOUnattend(isoName string) error {
 	a.log.Info("App", "Cleared autounattend.xml for %s", isoName)
 	wailsRuntime.EventsEmit(a.ctx, "iso:list-changed", a.isoMgr.List())
 	return nil
+}
+
+// ==================== Agent (Equipos) ====================
+
+func (a *App) AgentListClients() ([]agentproxy.RemoteClient, error) {
+	return a.agent.ListClients()
+}
+
+func (a *App) AgentPing(clientID string) (*agentproxy.TaskResponse, error) {
+	return a.agent.PingClient(clientID)
+}
+
+func (a *App) AgentCreateTestFile(clientID string) (*agentproxy.TaskResponse, error) {
+	return a.agent.CreateTestFile(clientID)
+}
+
+func (a *App) AgentOpenNotepad(clientID string) (*agentproxy.TaskResponse, error) {
+	return a.agent.OpenNotepad(clientID)
+}
+
+func (a *App) AgentGetTasks(clientID string) ([]agentproxy.RemoteTask, error) {
+	return a.agent.GetClientTasks(clientID)
+}
+
+func (a *App) AgentGetSystemInfo(clientID string) (*agentproxy.TaskResponse, error) {
+	return a.agent.GetSystemInfo(clientID)
+}
+
+func (a *App) AgentGetHardware(clientID string) (*agentproxy.HardwareResponse, error) {
+	return a.agent.GetHardware(clientID)
+}
+
+func (a *App) AgentUpdateHardware(clientID string) error {
+	return a.agent.UpdateHardware(clientID)
 }
 
 func (a *App) BrowseISOUnattend(isoName string) (string, error) {

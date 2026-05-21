@@ -19,6 +19,8 @@ class AgentRegistration(BaseModel):
     ip: str
     os_version: str
     mac: Optional[str] = None
+    hardware: Optional[dict] = None
+    diagnostics: Optional[dict] = None
 
 
 class AgentHeartbeat(BaseModel):
@@ -41,6 +43,8 @@ class RemoteClient(BaseModel):
     status: str = "online"            # online | offline
     registered_at: float = 0.0
     last_seen: float = 0.0
+    hardware: Optional[dict] = None
+    diagnostics: Optional[dict] = None
 
 
 class Task(BaseModel):
@@ -101,6 +105,8 @@ def agent_register(reg: AgentRegistration):
         status="online",
         registered_at=now,
         last_seen=now,
+        hardware=reg.hardware,
+        diagnostics=reg.diagnostics,
     )
     if client_id not in task_queues:
         task_queues[client_id] = []
@@ -182,6 +188,45 @@ def api_open_notepad(client_id: str):
     return _enqueue(client_id, "open_notepad", {
         "path": r"C:\Temp\vengo_desde_el_servidor.txt",
     })
+
+
+@app.post("/api/clients/{client_id}/system-info")
+def api_system_info(client_id: str):
+    """Queue a full hardware + diagnostics collection task."""
+    return _enqueue(client_id, "system_info")
+
+
+@app.get("/api/clients/{client_id}/hardware")
+def api_get_hardware(client_id: str):
+    """Get stored hardware info for a client."""
+    c = clients.get(client_id)
+    if not c:
+        raise HTTPException(404, "not found")
+    return {
+        "hardware": c.hardware,
+        "diagnostics": c.diagnostics,
+    }
+
+
+@app.post("/api/clients/{client_id}/update-hardware")
+def api_update_hardware(client_id: str):
+    """Called internally to update stored hardware after system_info task completes."""
+    c = clients.get(client_id)
+    if not c:
+        raise HTTPException(404, "not found")
+    # Find the latest completed system_info task and parse its output
+    queue = task_queues.get(client_id, [])
+    for t in reversed(queue):
+        if t.task_type == "system_info" and t.status == "completed" and t.result_output:
+            import json
+            try:
+                data = json.loads(t.result_output)
+                c.hardware = data.get("hardware", c.hardware)
+                c.diagnostics = data.get("diagnostics", c.diagnostics)
+                return {"ok": True, "message": "hardware updated from task"}
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return {"ok": False, "message": "no completed system_info task found"}
 
 
 @app.get("/api/clients/{client_id}/tasks")

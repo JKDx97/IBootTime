@@ -1,4 +1,4 @@
-import { LayoutDashboard, Disc3, Monitor, Settings, ScreenShare } from 'lucide-react'
+import { LayoutDashboard, Disc3, Monitor, Settings, ScreenShare, Laptop } from 'lucide-react'
 import clsx from 'clsx'
 
 const navItems = [
@@ -6,6 +6,7 @@ const navItems = [
   { id: 'isos', label: 'ISO Manager', icon: Disc3 },
   { id: 'clients', label: 'Clients', icon: Monitor },
   { id: 'remote', label: 'Remote', icon: ScreenShare },
+  { id: 'equipos', label: 'Equipos', icon: Laptop },
   { id: 'config', label: 'Settings', icon: Settings },
 ]
 

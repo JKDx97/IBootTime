@@ -49,7 +49,7 @@ func (s *Server) TriggerRemote(ip string) error {
 	sess := s.sessions.GetByIP(ip)
 	if sess == nil {
 		if s.reverseVNC != nil && s.reverseVNC.HasConn(ip) {
-			s.sessions.SetRemoteReady(ip, 0, "")
+			s.sessions.SetRemoteReady(ip, 0, "", "")
 			s.log.Info("VNC", "Auto-created session for %s (has reverse conn)", ip)
 		} else {
 			return fmt.Errorf("no client session for IP %s", ip)
@@ -59,7 +59,7 @@ func (s *Server) TriggerRemote(ip string) error {
 		if s.reverseVNC == nil || !s.reverseVNC.HasConn(ip) {
 			return fmt.Errorf("client %s has not reported VNC readiness yet", ip)
 		}
-		s.sessions.SetRemoteReady(ip, 0, "")
+		s.sessions.SetRemoteReady(ip, 0, "", "")
 	}
 
 	// Drop any stale stored connection so the client creates a FRESH one.

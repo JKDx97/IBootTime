@@ -28,7 +28,16 @@ type Proxy struct {
 func New(pythonServerURL string) *Proxy {
 	// Resolve agent_server/main.py relative to the executable
 	exe, _ := os.Executable()
-	scriptDir := filepath.Join(filepath.Dir(exe), "agent_server")
+	exeDir := filepath.Dir(exe)
+	scriptDir := filepath.Join(exeDir, "agent_server")
+
+	// Dev mode: exe is in build/bin/, project root is two levels up
+	if _, err := os.Stat(filepath.Join(scriptDir, "main.py")); err != nil {
+		projectRoot := filepath.Join(exeDir, "..", "..")
+		if _, err2 := os.Stat(filepath.Join(projectRoot, "wails.json")); err2 == nil {
+			scriptDir = filepath.Join(projectRoot, "agent_server")
+		}
+	}
 
 	return &Proxy{
 		baseURL:   pythonServerURL,
@@ -121,6 +130,13 @@ type RemoteClient struct {
 	Status      string  `json:"status"`
 	RegisterdAt float64 `json:"registered_at"`
 	LastSeen    float64 `json:"last_seen"`
+	Hardware    any     `json:"hardware"`
+	Diagnostics any     `json:"diagnostics"`
+}
+
+type HardwareResponse struct {
+	Hardware    any `json:"hardware"`
+	Diagnostics any `json:"diagnostics"`
 }
 
 type RemoteTask struct {
@@ -187,6 +203,41 @@ func (p *Proxy) GetClientTasks(clientID string) ([]RemoteTask, error) {
 		return nil, err
 	}
 	return result.Tasks, nil
+}
+
+// GetSystemInfo queues a full hardware + diagnostics collection task.
+func (p *Proxy) GetSystemInfo(clientID string) (*TaskResponse, error) {
+	return p.postAction(clientID, "system-info")
+}
+
+// GetHardware returns stored hardware/diagnostics data for a client.
+func (p *Proxy) GetHardware(clientID string) (*HardwareResponse, error) {
+	resp, err := p.client.Get(fmt.Sprintf("%s/api/clients/%s/hardware", p.baseURL, clientID))
+	if err != nil {
+		return nil, fmt.Errorf("agent server unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var result HardwareResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// UpdateHardware tells the server to refresh stored hw data from the latest completed task.
+func (p *Proxy) UpdateHardware(clientID string) error {
+	resp, err := p.client.Post(fmt.Sprintf("%s/api/clients/%s/update-hardware", p.baseURL, clientID), "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("agent server unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("error %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 func (p *Proxy) postAction(clientID, action string) (*TaskResponse, error) {

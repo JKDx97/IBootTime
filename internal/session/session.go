@@ -26,6 +26,7 @@ const (
 type ClientSession struct {
 	MAC              string    `json:"mac"`
 	IP               string    `json:"ip"`
+	Hostname         string    `json:"hostname"`
 	Arch             string    `json:"arch"`
 	State            BootState `json:"state"`
 	ISOName          string    `json:"isoName"`
@@ -185,7 +186,7 @@ func (m *Manager) AssignISO(mac, isoName string) bool {
 	return false
 }
 
-func (m *Manager) SetRemoteReady(ip string, vncPort int, password string) {
+func (m *Manager) SetRemoteReady(ip string, vncPort int, password, hostname string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -195,6 +196,9 @@ func (m *Manager) SetRemoteReady(ip string, vncPort int, password string) {
 			s.RemoteAvailable = true
 			s.RemoteVncPort = vncPort
 			s.RemotePassword = password
+			if hostname != "" {
+				s.Hostname = hostname
+			}
 			s.LastSeen = time.Now()
 			if m.onUpdate != nil {
 				m.onUpdate(*s)
@@ -207,6 +211,7 @@ func (m *Manager) SetRemoteReady(ip string, vncPort int, password string) {
 	s := &ClientSession{
 		MAC:             "unknown",
 		IP:              ip,
+		Hostname:        hostname,
 		State:           StateLoading,
 		RemoteAvailable: true,
 		RemoteVncPort:   vncPort,

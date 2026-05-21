@@ -285,13 +285,18 @@ func buildVNCStartScript(serverIP string, httpPort, vncPort int) string {
 	sb.WriteString("ping -n 6 127.0.0.1 >nul\r\n")
 	sb.WriteString("\r\n")
 
+	// Get hostname for display in the UI
+	sb.WriteString("set MYHOST=%COMPUTERNAME%\r\n")
+	sb.WriteString("if \"%MYHOST%\"==\"\" set MYHOST=WinPE\r\n")
+	sb.WriteString("\r\n")
+
 	// Beacon back to server — report readiness but do NOT connect yet.
 	// The server operator must press "Conectar" in the UI which sets a flag;
 	// the client polls /api/winpe/vnc-check and only then dials out.
 	sb.WriteString(":: Beacon back to IBootTime server\r\n")
 	sb.WriteString("echo [IBootTime] VNC: Enviando beacon al servidor...\r\n")
 	sb.WriteString("%CURL% -s -X POST -H \"Content-Type: application/json\" --connect-timeout 15 --retry 3 --retry-delay 2 ^\r\n")
-	sb.WriteString("  -d \"{\\\"ip\\\":\\\"%MYIP%\\\",\\\"port\\\":%VNCPORT%,\\\"password\\\":\\\"%VNCPW%\\\"}\" ^\r\n")
+	sb.WriteString("  -d \"{\\\"ip\\\":\\\"%MYIP%\\\",\\\"port\\\":%VNCPORT%,\\\"password\\\":\\\"%VNCPW%\\\",\\\"hostname\\\":\\\"%MYHOST%\\\"}\" ^\r\n")
 	sb.WriteString("  \"%IBTSERVER%/api/winpe/remote-ready\"\r\n")
 	sb.WriteString("if errorlevel 1 (\r\n")
 	sb.WriteString("  echo [IBootTime] VNC: Beacon FALLO.\r\n")
