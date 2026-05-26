@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Power, Wifi, Server, HardDrive, ScrollText, Monitor, Layers, Terminal, Cpu, ScreenShare } from 'lucide-react'
-import { StartServer, StopServer, GetServerStatus, IsServerRunning, GetConnectedClients, GetRecentLogs, GetBootProtocol, TriggerRemote } from '../../wailsjs/go/main/App'
-import { BrowserOpenURL, EventsOn } from '../../wailsjs/runtime/runtime'
+import { StartServer, StopServer, GetServerStatus, IsServerRunning, GetConnectedClients, GetRecentLogs, GetBootProtocol } from '../../wailsjs/go/main/App'
+import { EventsOn } from '../../wailsjs/runtime/runtime'
 import clsx from 'clsx'
 
 function StatusCard({ label, active, icon: Icon }) {
@@ -220,30 +220,10 @@ export default function Dashboard() {
                     {c.progress > 0 && (
                       <span className="text-emerald-400 shrink-0">{c.progress.toFixed(1)}%</span>
                     )}
-                    {c.remoteAvailable ? (
-                      <button
-                        onClick={async () => {
-                          try {
-                            setError('')
-                            await TriggerRemote(c.ip)
-                            const url = `http://${status.ip}:${status.httpPort || 8080}/novnc?host=${c.ip}&port=${c.remoteVncPort || 5900}&password=${c.remotePassword || ''}&mode=reverse`
-                            BrowserOpenURL(url)
-                          } catch (e) {
-                            setError(`VNC trigger failed: ${e}`)
-                          }
-                        }}
-                        className="shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30 transition-colors"
-                        title="Enviar orden de conexion VNC al cliente"
-                      >
-                        <ScreenShare size={12} />
-                        <span>Conectar</span>
-                      </button>
-                    ) : (
-                      <span className="shrink-0 text-slate-600 flex items-center gap-1">
-                        <ScreenShare size={12} />
-                        <span>Sin VNC</span>
-                      </span>
-                    )}
+                    <span className="shrink-0 text-emerald-400 flex items-center gap-1">
+                      <ScreenShare size={12} />
+                      <span>Agente nativo</span>
+                    </span>
                   </div>
                 ))}
               </div>

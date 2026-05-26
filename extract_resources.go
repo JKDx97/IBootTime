@@ -23,8 +23,6 @@ func extractEmbeddedResources(exeDir string) {
 	}
 
 	bundles := []bundle{
-		{filepath.Join("remote", "winvnc", "winvnc.exe"), embeddedVNC, "UltraVNC"},
-		{filepath.Join("noVNC-master", "core", "rfb.js"), embeddedNoVNC, "noVNC"},
 		{filepath.Join("drivers", "drivers_universal"), embeddedDrivers, "Drivers"},
 	}
 

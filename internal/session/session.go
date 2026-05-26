@@ -15,12 +15,12 @@ func normalizeMAC(mac string) string {
 type BootState string
 
 const (
-	StateDiscovery  BootState = "discovery"
-	StateTFTP       BootState = "tftp"
-	StateMenu       BootState = "menu"
-	StateLoading    BootState = "loading"
-	StateCompleted  BootState = "completed"
-	StateError      BootState = "error"
+	StateDiscovery BootState = "discovery"
+	StateTFTP      BootState = "tftp"
+	StateMenu      BootState = "menu"
+	StateLoading   BootState = "loading"
+	StateCompleted BootState = "completed"
+	StateError     BootState = "error"
 )
 
 type ClientSession struct {
@@ -258,7 +258,11 @@ func (m *Manager) CleanStale(timeout time.Duration) {
 
 	now := time.Now()
 	for mac, s := range m.sessions {
-		if now.Sub(s.LastSeen) > timeout {
+		sessionTimeout := timeout
+		if s.RemoteAvailable {
+			sessionTimeout = 2 * time.Hour
+		}
+		if now.Sub(s.LastSeen) > sessionTimeout {
 			delete(m.sessions, mac)
 		}
 	}

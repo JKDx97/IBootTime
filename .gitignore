@@ -35,3 +35,12 @@ Desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Python cache
+__pycache__/
+
+# Go build cache
+.gocache/
+
+# Temp files
+tmp_unattend/

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Monitor, Wifi, ScreenShare, Lock, Send, ChevronDown } from 'lucide-react'
-import { GetConnectedClients, GetServerStatus, GetISOList, AssignISO } from '../../wailsjs/go/main/App'
+import { GetConnectedClients, GetISOList, AssignISO } from '../../wailsjs/go/main/App'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import clsx from 'clsx'
 
@@ -26,36 +26,24 @@ function ProgressBar({ value }) {
 
 export default function ClientMonitor() {
   const [clients, setClients] = useState([])
-  const [serverStatus, setServerStatus] = useState(null)
   const [isos, setIsos] = useState([])
 
   useEffect(() => {
     GetConnectedClients().then((c) => setClients(c || []))
-    GetServerStatus().then((s) => setServerStatus(s))
     GetISOList().then((l) => setIsos((l || []).filter(i => i.enabled)))
 
     const unsub = EventsOn('client:updated', () => {
       GetConnectedClients().then((c) => setClients(c || []))
     })
-    const unsub2 = EventsOn('server:status-changed', (s) => setServerStatus(s))
     const unsub3 = EventsOn('iso:list-changed', (l) => setIsos((l || []).filter(i => i.enabled)))
-    return () => { unsub(); unsub2(); unsub3() }
+    return () => { unsub(); unsub3() }
   }, [])
 
   const handleAssignISO = async (mac, isoName) => {
     await AssignISO(mac, isoName)
   }
 
-  const handleConnect = (client) => {
-    const serverIP = serverStatus?.ip || window.location.hostname
-    const httpPort = serverStatus?.httpPort || 8080
-    const port = client.remoteVncPort || 5900
-    const pw = client.remotePassword || ''
-    const url = `http://${serverIP}:${httpPort}/novnc?host=${client.ip}&port=${port}&password=${encodeURIComponent(pw)}`
-    window.open(url, '_blank')
-  }
-
-  const remoteCount = clients.filter(c => c.remoteAvailable).length
+  const remoteCount = clients.length
 
   return (
     <div className="space-y-6">
@@ -65,7 +53,7 @@ export default function ClientMonitor() {
           {remoteCount > 0 && (
             <span className="flex items-center gap-1.5 text-xs text-emerald-400">
               <ScreenShare size={13} />
-              {remoteCount} remote disponible{remoteCount !== 1 ? 's' : ''}
+              agente nativo
             </span>
           )}
           <span className="flex items-center gap-2 text-sm text-slate-400">
@@ -160,18 +148,10 @@ export default function ClientMonitor() {
                       {client.speed || '-'}
                     </td>
                     <td className="px-4 py-3 text-center">
-                      {client.remoteAvailable ? (
-                        <button
-                          onClick={() => handleConnect(client)}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25 transition-colors"
-                          title={`VNC: ${client.ip}:${client.remoteVncPort}`}
-                        >
-                          <ScreenShare size={13} />
-                          Connect
-                        </button>
-                      ) : (
-                        <span className="text-xs text-slate-600">-</span>
-                      )}
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                        <ScreenShare size={13} />
+                        Native
+                      </span>
                     </td>
                   </tr>
                 )

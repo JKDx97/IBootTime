@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,8 +48,12 @@ type Server struct {
 	onPrepProgress func(phase string, current, total int, detail string)
 	onPrepDone     func()
 
-	// Reverse VNC listener: WinPE clients dial in to us, bypassing their
-	// local firewall. Nil until Start() completes.
+	// Signal closed when all boot.wim preparations are finished.
+	// tryServeModifiedBootWim waits on this to avoid serving the
+	// original (un-injected) boot.wim while DISM is still running.
+	bootWimReady chan struct{}
+
+	// Legacy reverse VNC listener used as a compatibility fallback.
 	reverseVNC *ReverseVNCListener
 }
 
@@ -80,30 +83,26 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/wimboot", s.handleWimboot)
 	mux.HandleFunc("/iso/", s.handleISOFile)
 	mux.HandleFunc("/health", s.handleHealth)
-	// VNC remote control endpoints
+	// Native remote control endpoint.
+	mux.HandleFunc("/ws/remote", s.handleScreenRemote)
+	// Legacy WinPE/VNC endpoints are still registered as a compatibility
+	// fallback for boot.wim caches or clients built before the native agent.
+	mux.HandleFunc("/ws/vnc", s.handleVNCProxy)
+	mux.HandleFunc("/novnc", s.handleNoVNC)
+	if noVNCDir := s.findNoVNCDir(); noVNCDir != "" {
+		mux.Handle("/novnc-static/", http.StripPrefix("/novnc-static/", http.FileServer(http.Dir(noVNCDir))))
+	}
 	mux.HandleFunc("/api/winpe/remote-ready", s.handleRemoteBeacon)
 	mux.HandleFunc("/api/winpe/vnc-config", s.handleVNCConfig)
 	mux.HandleFunc("/api/winpe/vnc-ini", s.handleVNCIni)
 	mux.HandleFunc("/api/winpe/vnc-password", s.handleVNCPassword)
-	mux.HandleFunc("/ws/vnc", s.handleVNCProxy)
-	mux.HandleFunc("/novnc", s.handleNoVNC)
 	mux.HandleFunc("/api/winpe/vnc-check", s.handleVNCCheck)
 	mux.HandleFunc("/api/remote/trigger", s.handleRemoteTrigger)
-	// VNC post-install endpoints (for Windows OOBE persistence)
 	mux.HandleFunc("/api/vnc/files/", s.handleVNCFileDownload)
 	mux.HandleFunc("/api/vnc/setup-script", s.handleVNCSetupScript)
 	mux.HandleFunc("/api/vnc/unattend", s.handleUnattend)
 	// Per-ISO autounattend.xml endpoint
 	mux.HandleFunc("/api/iso-unattend", s.handleISOUnattend)
-	// Serve noVNC static files locally (no CDN needed)
-	noVNCDir := s.findNoVNCDir()
-	if noVNCDir != "" {
-		s.log.Info("HTTP", "Serving noVNC static files from %s", noVNCDir)
-		mux.Handle("/novnc-static/", http.StripPrefix("/novnc-static/", http.FileServer(http.Dir(noVNCDir))))
-	} else {
-		s.log.Warn("HTTP", "noVNC-master directory not found — remote viewer won't work")
-	}
-
 	addr := fmt.Sprintf(":%d", s.port)
 
 	s.httpServer = &http.Server{
@@ -117,18 +116,19 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.log.Info("HTTP", "Starting HTTP boot server on %s", addr)
 
+	if s.cfg.GetWinPERemote() {
+		s.reverseVNC = NewReverseVNCListener(DefaultReverseVNCPort, s.log, s.sessions)
+		if err := s.reverseVNC.Start(ctx); err != nil {
+			s.log.Warn("VNC", "Reverse VNC compatibility listener unavailable on :%d: %v", DefaultReverseVNCPort, err)
+			s.reverseVNC = nil
+		}
+	}
+
 	go func() {
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			s.log.Error("HTTP", "Server error: %v", err)
 		}
 	}()
-
-	// Start reverse VNC listener so WinPE clients can dial in to us.
-	s.reverseVNC = NewReverseVNCListener(DefaultReverseVNCPort, s.log, s.sessions)
-	if err := s.reverseVNC.Start(ctx); err != nil {
-		s.log.Warn("VNC", "Reverse VNC listener not available: %v", err)
-		s.reverseVNC = nil
-	}
 
 	go func() {
 		<-ctx.Done()
@@ -142,9 +142,11 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Phase 1: Mount ALL ISOs and create SMB shares (fast, ~5s per ISO)
 	// Phase 2: DISM modify boot.wim for Windows ISOs (only if cache is stale)
+	s.bootWimReady = make(chan struct{})
 	go func() {
 		s.shareAllISOs()
 		s.prepareWindowsBootWims()
+		close(s.bootWimReady)
 	}()
 
 	return nil
@@ -187,13 +189,28 @@ func (s *Server) cleanupSMBShares() {
 
 const smbUser = "Administrador"
 const smbPass = "P0s31d0n"
-const cacheVersion = "v40-agent-reconnect"
+const cacheVersion = "v60-conditional-safe-unattend"
 
 // safeNetDriveLetters lists drive letters safe for net use in WinPE.
 // Avoids: A/B (floppy), C (system), D (common CD/HDD), E (common),
 // F (common USB), X (WinPE RAM disk), Y/Z (we use these for SMB shares)
 var safeNetDriveLetters = []string{
 	"Z", "Y", "W", "V", "U", "T", "S", "R", "Q", "P", "O", "N", "M", "L", "K", "J", "I", "H", "G", "F",
+}
+
+// computeCacheVersion returns the full version string used to validate
+// cached boot.wim files. It includes server IP, port, config flags, and
+// driver info so that any change triggers a rebuild.
+func (s *Server) computeCacheVersion() string {
+	driverTag := "nodrivers"
+	if dDir := s.findDriversDir(); dDir != "" {
+		if entries, _ := os.ReadDir(dDir); len(entries) > 0 {
+			driverTag = fmt.Sprintf("drivers:%d", len(entries))
+		}
+	}
+	return fmt.Sprintf("%s|ip=%s|port=%d|vnc=%v|vncport=%d|user=%s|%s",
+		cacheVersion, s.serverIP, s.port,
+		s.cfg.GetWinPERemote(), s.cfg.GetWinPEVncPort(), smbUser, driverTag)
 }
 
 // preloadBootWimCache scans disk for previously cached boot.wim files and
@@ -220,7 +237,8 @@ func (s *Server) preloadBootWimCache() {
 		if _, err := os.Stat(cachedWim); err != nil {
 			continue
 		}
-		if data, err := os.ReadFile(versionFile); err != nil || string(data) != cacheVersion {
+		fullVersion := s.computeCacheVersion()
+		if data, err := os.ReadFile(versionFile); err != nil || string(data) != fullVersion {
 			continue
 		}
 
@@ -408,6 +426,15 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 	}
 	s.log.Info("HTTP", "Found boot.wim: %s", srcBootWim)
 
+	isoRoot := isoDrive + ":\\"
+	useSafeUnattend := hasEmbeddedUnattend(isoRoot)
+	setupCommand := buildSetupExeCommand(driveLetter, useSafeUnattend)
+	if useSafeUnattend {
+		s.log.Info("HTTP", "Embedded unattend detected in %s; launching setup with safe unattend override", iso.Name)
+	} else {
+		s.log.Info("HTTP", "No embedded unattend detected in %s; launching setup without /unattend", iso.Name)
+	}
+
 	// 3. Create cache directory
 	isoDir := filepath.Dir(iso.Path)
 	cacheID := sanitizeMenuID(iso.Name)
@@ -426,15 +453,7 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 
 	// Version marker — includes server IP, port, and VNC config so WIM is
 	// rebuilt automatically whenever the network environment changes.
-	driverTag := "nodrivers"
-	if dDir := s.findDriversDir(); dDir != "" {
-		if entries, _ := os.ReadDir(dDir); len(entries) > 0 {
-			driverTag = fmt.Sprintf("drivers:%d", len(entries))
-		}
-	}
-	fullVersion := fmt.Sprintf("%s|ip=%s|port=%d|vnc=%v|vncport=%d|user=%s|%s",
-		cacheVersion, s.serverIP, s.port,
-		s.cfg.GetWinPERemote(), s.cfg.GetWinPEVncPort(), smbUser, driverTag)
+	fullVersion := s.computeCacheVersion()
 	versionFile := filepath.Join(cacheDir, ".version")
 	if versionData, err := os.ReadFile(versionFile); err == nil && string(versionData) == fullVersion {
 		// version matches — keep existing rebuild decision
@@ -485,7 +504,6 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 		s.log.Info("HTTP", "Detected %d WIM index(es) in boot.wim", maxIndex)
 
 		shareName := "IB_" + cacheID
-		_ = url.QueryEscape(iso.Name) // encodedISOName — used when autounattend is re-enabled
 
 		// Only modify the highest index (Index 2 = Windows Setup, which BCD boots)
 		// Index 1 (plain WinPE) is a rarely-used fallback — skip to halve DISM time
@@ -520,6 +538,22 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 				}
 			}
 
+			// -- Inject a safe answer file before startnet.cmd --
+			// Some custom/desatendido ISOs include a root autounattend.xml with
+			// regional settings that do not match the install media. Windows Setup
+			// auto-discovers that file and can fail with 0x80FE0000 while applying
+			// offline regional configuration. Passing this known-safe answer file
+			// explicitly makes Setup ignore the ISO-root autounattend.xml while still
+			// leaving install/OOBE interactive for the technician.
+			safeUnattendDir := filepath.Join(idxMountDir, "IBootTime")
+			if err := os.MkdirAll(safeUnattendDir, 0755); err != nil {
+				s.log.Warn("HTTP", "Failed to create IBootTime dir for safe unattend index %d: %v", idx, err)
+			}
+			safeUnattendPath := filepath.Join(safeUnattendDir, "safe-unattend.xml")
+			if err := os.WriteFile(safeUnattendPath, []byte(buildSafeWindowsSetupUnattend()), 0644); err != nil {
+				s.log.Warn("HTTP", "Failed to write safe unattend index %d: %v", idx, err)
+			}
+
 			// -- Inject startnet.cmd --
 			startnetPath := filepath.Join(idxMountDir, "Windows", "System32", "startnet.cmd")
 			var startnetContent string
@@ -538,18 +572,18 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					"echo.\r\n"+
 					"ipconfig\r\n"+
 					"echo.\r\n"+
-					"echo [IBootTime] Esperando conexion con %s ...\r\n"+       // 1: serverIP
+					"echo [IBootTime] Esperando conexion con %s ...\r\n"+ // 1: serverIP
 					":waitnet\r\n"+
-					"ping -n 1 -w 1000 %s >nul 2>&1\r\n"+                      // 2: serverIP
+					"ping -n 1 -w 1000 %s >nul 2>&1\r\n"+ // 2: serverIP
 					"if errorlevel 1 goto waitnet\r\n"+
 					"echo [IBootTime] Servidor alcanzado.\r\n"+
 					"echo.\r\n"+
 					"echo ===== PUNTO 1: net use =====\r\n"+
 					"set R=0\r\n"+
 					":retry\r\n"+
-					"net use %s: \\\\%s\\%s /user:%s \"%s\"\r\n"+              // 3-7: drive,srv,share,user,pass
+					"net use %s: \\\\%s\\%s /user:%s \"%s\"\r\n"+ // 3-7: drive,srv,share,user,pass
 					"if not errorlevel 1 goto ok\r\n"+
-					"net use %s: \\\\%s\\%s\r\n"+                              // 8-10: drive,srv,share
+					"net use %s: \\\\%s\\%s\r\n"+ // 8-10: drive,srv,share
 					"if not errorlevel 1 goto ok\r\n"+
 					"set /a R+=1\r\n"+
 					"if %%R%% GEQ 30 goto fail\r\n"+
@@ -558,24 +592,22 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					"goto retry\r\n"+
 					":ok\r\n"+
 					"echo ===== PUNTO 2: net use OK =====\r\n"+
-					"echo [IBootTime] %s: conectada.\r\n"+                     // 11: drive
-					"dir %s:\\ /w\r\n"+                                        // 12: drive
+					"echo [IBootTime] %s: conectada.\r\n"+ // 11: drive
+					"dir %s:\\ /w\r\n"+ // 12: drive
 					"echo.\r\n"+
 					"echo ===== PUNTO 3: verificando setup.exe =====\r\n"+
-					"if exist %s:\\sources\\setup.exe (\r\n"+                   // 13: drive
-					"  echo [IBootTime] setup.exe encontrado OK\r\n"+
+					"if exist %s:\\setup.exe (\r\n"+ // 13: drive
+					"  echo [IBootTime] setup.exe raiz encontrado OK\r\n"+
 					") else (\r\n"+
-					"  echo [IBootTime] ERROR: setup.exe NO encontrado\r\n"+
+					"  echo [IBootTime] ERROR: setup.exe raiz NO encontrado\r\n"+
 					"  cmd /k\r\n"+
 					")\r\n"+
 					"echo.\r\n"+
 					"echo ===== PUNTO 4: Lanzando setup.exe =====\r\n"+
-					"echo [IBootTime] Presiona una tecla para lanzar setup...\r\n"+
-					"pause\r\n"+
-					"%s:\\sources\\setup.exe\r\n"+                              // 14: drive
+					"%s\r\n"+ // 14: setup command
 					"echo ===== PUNTO 5: setup termino (err=%%errorlevel%%) =====\r\n"+
 					"echo [IBootTime] El instalador se cerro.\r\n"+
-					"echo Para reintentar: %s:\\sources\\setup.exe\r\n"+        // 15: drive
+					"echo Para reintentar: %s\r\n"+ // 15: setup command
 					"cmd /k\r\n"+
 					":fail\r\n"+
 					"echo [IBootTime] Error de conexion despues de 30 intentos.\r\n"+
@@ -583,20 +615,20 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					"ipconfig\r\n"+
 					"echo.\r\n"+
 					"echo Intenta manual:\r\n"+
-					"echo   net use %s: \\\\%s\\%s /user:%s \"%s\"\r\n"+       // 16-20: drive,srv,share,user,pass
-					"echo   %s:\\sources\\setup.exe\r\n"+                      // 21: drive
+					"echo   net use %s: \\\\%s\\%s /user:%s \"%s\"\r\n"+ // 16-20: drive,srv,share,user,pass
+					"echo   %s\r\n"+ // 21: setup command
 					"cmd /k\r\n",
 					s.serverIP,                                           // 1: Esperando conexion
 					s.serverIP,                                           // 2: ping
 					driveLetter, s.serverIP, shareName, smbUser, smbPass, // 3-7: net use auth
-					driveLetter, s.serverIP, shareName,                   // 8-10: net use no-auth
+					driveLetter, s.serverIP, shareName, // 8-10: net use no-auth
 					driveLetter,                                          // 11: conectada
 					driveLetter,                                          // 12: dir
 					driveLetter,                                          // 13: if exist setup.exe
-					driveLetter,                                          // 14: setup.exe
-					driveLetter,                                          // 15: reintentar
+					setupCommand,                                         // 14: setup.exe
+					setupCommand,                                         // 15: reintentar
 					driveLetter, s.serverIP, shareName, smbUser, smbPass, // 16-20: fail net use
-					driveLetter,                                          // 21: fail setup
+					setupCommand, // 21: fail setup
 				)
 			} else {
 				// Index 1 (plain WinPE): wpeinit + network init + wait for IP + net use
@@ -629,10 +661,10 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					"goto retry\r\n"+
 					":connected\r\n"+
 					"echo [IBootTime] %s: conectada. Lanzando instalador...\r\n"+
-					"%s:\\setup.exe\r\n"+
+					"%s\r\n"+
 					"echo.\r\n"+
 					"echo [IBootTime] El instalador se cerro o fallo.\r\n"+
-					"echo Para reintentar: %s:\\setup.exe\r\n"+
+					"echo Para reintentar: %s\r\n"+
 					"cmd /k\r\n"+
 					":manual\r\n"+
 					"echo [IBootTime] Error de conexion despues de 30 intentos.\r\n"+
@@ -641,7 +673,7 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					"echo.\r\n"+
 					"echo Intenta manual:\r\n"+
 					"echo   net use %s: \\\\%s\\%s /user:%s \"%s\"\r\n"+
-					"echo   %s:\\setup.exe\r\n"+
+					"echo   %s\r\n"+
 					"cmd /k\r\n",
 					s.serverIP,
 					s.serverIP,
@@ -649,10 +681,10 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					driveLetter, s.serverIP, shareName, smbUser, smbPass,
 					driveLetter, s.serverIP, shareName,
 					driveLetter,
-					driveLetter,
-					driveLetter,
+					setupCommand,
+					setupCommand,
 					driveLetter, s.serverIP, shareName, smbUser, smbPass,
-					driveLetter,
+					setupCommand,
 				)
 			}
 
@@ -666,26 +698,25 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 				s.log.Info("HTTP", "Agent injected into index %d", idx)
 			}
 
-			// -- Inject VNC remote control (if enabled) --
+			// -- Inject native remote control agent (if enabled) --
 			if s.cfg.GetWinPERemote() {
-				vncPort := s.cfg.GetWinPEVncPort()
-				if err := s.injectVNCIntoWIM(idxMountDir, s.serverIP, s.port, vncPort); err != nil {
-					s.log.Warn("HTTP", "VNC injection index %d (non-fatal): %v", idx, err)
+				if err := s.injectScreenAgentIntoWIM(idxMountDir, s.serverIP, s.port); err != nil {
+					s.log.Warn("HTTP", "Native remote injection index %d (non-fatal): %v", idx, err)
 				} else {
-					bootstrapLine := "\r\n:: IBootTime Persistent Reverse VNC Bootstrap\r\nstart \"\" /B cmd /c X:\\IBootTime\\vnc\\install_post_vnc.cmd\r\n\r\n"
-					vncLine := "\r\n:: IBootTime VNC Remote Control\r\nstart \"\" /B cmd /c X:\\IBootTime\\vnc\\start_vnc.cmd\r\n\r\n"
+					bootstrapLine := "\r\n:: IBootTime Native Remote Post-Install Bootstrap\r\nstart \"\" /B cmd /c X:\\IBootTime\\remote\\install_post_screen_agent.cmd\r\n\r\n"
+					remoteLine := "\r\n:: IBootTime Native Remote Control - forced direct start + watchdog\r\nstart \"\" /B X:\\IBootTime\\remote\\screen_agent.exe -server \"ws://" + s.serverIP + fmt.Sprintf(":%d/ws/remote", s.port) + "\" -fps 20 -quality 92 -interactive\r\nstart \"\" /B cmd /c X:\\IBootTime\\remote\\start_screen_agent.cmd\r\n\r\n"
 					if strings.Contains(startnetContent, "echo [IBootTime] Servidor alcanzado.\r\n") {
 						startnetContent = strings.Replace(startnetContent, "echo [IBootTime] Servidor alcanzado.\r\n", "echo [IBootTime] Servidor alcanzado.\r\n"+bootstrapLine, 1)
 					} else if strings.Contains(startnetContent, "echo [IBootTime] Servidor alcanzado. Conectando") {
 						startnetContent = strings.Replace(startnetContent, "echo [IBootTime] Servidor alcanzado. Conectando", bootstrapLine+"echo [IBootTime] Servidor alcanzado. Conectando", 1)
 					}
 					if strings.Contains(startnetContent, ":retry\r\n") {
-						startnetContent = strings.Replace(startnetContent, ":retry\r\n", vncLine+":retry\r\n", 1)
+						startnetContent = strings.Replace(startnetContent, ":retry\r\n", remoteLine+":retry\r\n", 1)
 					} else {
 						// Fallback: insert before first "net use" line
-						startnetContent = strings.Replace(startnetContent, "net use ", vncLine+"net use ", 1)
+						startnetContent = strings.Replace(startnetContent, "net use ", remoteLine+"net use ", 1)
 					}
-					s.log.Info("HTTP", "VNC remote injected into index %d", idx)
+					s.log.Info("HTTP", "Native remote control injected into index %d", idx)
 				}
 			}
 
@@ -742,6 +773,55 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 
 	s.log.Info("HTTP", "=== Windows install ready: %s (share: \\\\%s\\%s) ===", iso.Name, s.serverIP, shareName)
 	return shareName, nil
+}
+
+func buildSetupExeCommand(driveLetter string, useSafeUnattend bool) string {
+	cmd := fmt.Sprintf("%s:\\setup.exe", driveLetter)
+	if useSafeUnattend {
+		cmd += " /unattend:X:\\IBootTime\\safe-unattend.xml"
+	}
+	return cmd
+}
+
+func hasEmbeddedUnattend(isoRoot string) bool {
+	candidates := []string{
+		"autounattend.xml",
+		"Autounattend.xml",
+		"AUTOUNATTEND.XML",
+		filepath.Join("sources", "$OEM$", "$$", "Panther", "unattend.xml"),
+		filepath.Join("sources", "$OEM$", "$$", "Panther", "Unattend.xml"),
+		filepath.Join("sources", "$OEM$", "$$", "Panther", "UNATTEND.XML"),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(filepath.Join(isoRoot, candidate)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// buildSafeWindowsSetupUnattend returns a minimal answer file used only to
+// override broken autounattend.xml files embedded at the root of custom ISOs.
+// Keep this deliberately small: no product key, no disk partitioning, no OOBE
+// skips, and no specialize/oobeSystem regional settings. The goal is only to
+// select the setup UI language with values that match Spanish installation
+// media (lang.ini: es-es), then leave Windows Setup interactive.
+func buildSafeWindowsSetupUnattend() string {
+	return `<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>es-ES</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>es-ES</InputLocale>
+      <SystemLocale>es-ES</SystemLocale>
+      <UILanguage>es-ES</UILanguage>
+      <UserLocale>es-ES</UserLocale>
+    </component>
+  </settings>
+</unattend>
+`
 }
 
 // copyFile copies a file from src to dst
@@ -875,7 +955,7 @@ func (s *Server) handleBootScript(w http.ResponseWriter, r *http.Request) {
 	// Menu
 	script.WriteString(":start\n")
 	script.WriteString("menu IBootTime - Network Boot Server [${server-ip}]\n")
-	
+
 	logo := []string{
 		"",
 		"  ###  TIMELESS  SUPPORT  ###",
@@ -1248,7 +1328,28 @@ func (s *Server) tryServeModifiedBootWim(w http.ResponseWriter, r *http.Request,
 
 	cached, ok := s.bootWimCache.Load(iso.Path)
 	if !ok {
-		return false
+		// DISM might still be running — wait for it to finish before falling
+		// back to the original (un-injected) boot.wim.
+		if s.bootWimReady != nil {
+			s.log.Info("HTTP", "boot.wim not cached yet for %s — waiting for DISM preparation...", iso.Name)
+			select {
+			case <-s.bootWimReady:
+				// Preparation finished, re-check cache
+			case <-r.Context().Done():
+				// Client cancelled the request
+				return false
+			case <-time.After(10 * time.Minute):
+				s.log.Warn("HTTP", "Timeout (10 min) waiting for boot.wim preparation for %s", iso.Name)
+				return false
+			}
+			cached, ok = s.bootWimCache.Load(iso.Path)
+			if !ok {
+				s.log.Warn("HTTP", "boot.wim still not cached for %s after DISM completed", iso.Name)
+				return false
+			}
+		} else {
+			return false
+		}
 	}
 
 	cachedPath := cached.(string)
@@ -1276,7 +1377,10 @@ func (s *Server) tryServeFromISO9660(w http.ResponseWriter, r *http.Request, iso
 	}
 
 	resolvedPath := filePath
-	var reader interface{ Read([]byte) (int, error); Seek(int64, int) (int64, error) }
+	var reader interface {
+		Read([]byte) (int, error)
+		Seek(int64, int) (int64, error)
+	}
 	var size int64
 	if iso.OSType == isomgr.OSTypeWindows || iso.OSType == isomgr.OSTypeWinPE {
 		reader, size, resolvedPath, err = isoGetWindowsBootFileReader(isoImg, filePath)
@@ -1416,4 +1520,3 @@ func sanitizeMenuID(name string) string {
 	replacer := strings.NewReplacer(" ", "-", ".", "-", "_", "-", "(", "", ")", "")
 	return replacer.Replace(name)
 }
-

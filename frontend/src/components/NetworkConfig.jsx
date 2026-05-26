@@ -272,15 +272,14 @@ export default function NetworkConfig() {
         <div className="flex items-center gap-2 mb-1">
           <ScreenShare size={18} className="text-emerald-400" />
           <h3 className="text-sm font-semibold text-white">Control Remoto (WinPE)</h3>
-          <span className="ml-auto text-xs text-slate-500">VNC durante la instalación</span>
+          <span className="ml-auto text-xs text-slate-500">Agente nativo durante la instalación</span>
         </div>
 
         <div className="flex items-center justify-between">
           <div className="space-y-1">
             <p className="text-sm text-slate-300">Habilitar control remoto en WinPE</p>
             <p className="text-xs text-slate-500">
-              Inyecta un servidor VNC en el boot.wim para controlar el instalador remotamente vía noVNC.
-              Requiere colocar UltraVNC portable en <code className="bg-slate-800 px-1 rounded">remote/winvnc/</code>
+              Inyecta <code className="bg-slate-800 px-1 rounded">screen_agent.exe</code> en el boot.wim para controlar el instalador por WebSocket binario.
             </p>
           </div>
           <button
@@ -301,8 +300,7 @@ export default function NetworkConfig() {
           <div className="flex items-center gap-2 px-3 py-2 rounded-lg border bg-amber-500/10 border-amber-500/30">
             <p className="text-xs text-amber-400">
               <strong>Nota:</strong> Al habilitar esta opción, la caché de boot.wim se reconstruirá la próxima vez que inicie el servidor.
-              Asegúrate de tener <code className="bg-slate-800 px-1 rounded">winvnc.exe</code> en la carpeta <code className="bg-slate-800 px-1 rounded">remote/winvnc/</code>.
-              La contraseña VNC se genera automáticamente por sesión.
+              Ya no se copia UltraVNC ni se usa noVNC; el cliente abre una conexión saliente hacia <code className="bg-slate-800 px-1 rounded">/ws/remote</code>.
             </p>
           </div>
         )}
