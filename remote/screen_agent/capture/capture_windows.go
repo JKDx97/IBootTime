@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	tileSize = 128
+	tileSize = 256
 
 	srccopy      = 0x00CC0020
 	captureblt   = 0x40000000
@@ -107,7 +107,11 @@ func (c *Capturer) CapturePackets() ([][]byte, error) {
 		return nil, err
 	}
 	c.seq++
-	if c.seq <= 10 || c.seq%16 == 0 {
+	// Send a keyframe at session start and periodically afterward. At 60 FPS,
+	// repeated full JPEG frames create visible latency spikes; tile deltas keep
+	// realtime control fluid while the periodic full frame self-heals any missed
+	// tile updates.
+	if c.seq == 1 || c.seq%120 == 0 {
 		c.fullNext = true
 	}
 

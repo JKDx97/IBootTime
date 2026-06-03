@@ -29,6 +29,7 @@ func New(pythonServerURL string) *Proxy {
 	// Resolve agent_server/main.py relative to the executable
 	exe, _ := os.Executable()
 	exeDir := filepath.Dir(exe)
+	wd, _ := os.Getwd()
 	scriptDir := filepath.Join(exeDir, "agent_server")
 
 	// Dev mode: exe is in build/bin/, project root is two levels up
@@ -36,6 +37,8 @@ func New(pythonServerURL string) *Proxy {
 		projectRoot := filepath.Join(exeDir, "..", "..")
 		if _, err2 := os.Stat(filepath.Join(projectRoot, "wails.json")); err2 == nil {
 			scriptDir = filepath.Join(projectRoot, "agent_server")
+		} else if _, err3 := os.Stat(filepath.Join(wd, "agent_server", "main.py")); err3 == nil {
+			scriptDir = filepath.Join(wd, "agent_server")
 		}
 	}
 
@@ -57,15 +60,16 @@ func (p *Proxy) Start() error {
 		return nil // already running
 	}
 
+	if p.isHTTPReady() {
+		return nil // an agent server is already listening
+	}
+
 	script := filepath.Join(p.scriptDir, "main.py")
 	if _, err := os.Stat(script); err != nil {
 		return fmt.Errorf("agent_server/main.py not found at %s", script)
 	}
 
-	pythonBin := "python"
-	if runtime.GOOS != "windows" {
-		pythonBin = "python3"
-	}
+	pythonBin := p.resolvePython()
 
 	p.cmd = hidecmd.Command(pythonBin, script)
 	p.cmd.Dir = p.scriptDir
@@ -80,14 +84,43 @@ func (p *Proxy) Start() error {
 	// Wait for the server to be ready (up to 10s)
 	for i := 0; i < 20; i++ {
 		time.Sleep(500 * time.Millisecond)
-		resp, err := p.client.Get(p.baseURL + "/api/clients")
-		if err == nil {
-			resp.Body.Close()
+		if p.isHTTPReady() {
 			return nil
 		}
 	}
 
 	return fmt.Errorf("python agent server started but not responding on %s", p.baseURL)
+}
+
+func (p *Proxy) isHTTPReady() bool {
+	resp, err := p.client.Get(p.baseURL + "/api/clients")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 500
+}
+
+func (p *Proxy) resolvePython() string {
+	exe, _ := os.Executable()
+	exeDir := filepath.Dir(exe)
+	wd, _ := os.Getwd()
+
+	candidates := []string{
+		filepath.Join(exeDir, "tools", "python-embed", "python.exe"),
+		filepath.Join(exeDir, "..", "..", "tools", "python-embed", "python.exe"),
+		filepath.Join(wd, "tools", "python-embed", "python.exe"),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	if runtime.GOOS != "windows" {
+		return "python3"
+	}
+	return "python"
 }
 
 // Stop kills the Python agent server process.

@@ -14,6 +14,8 @@ const (
 	MsgMouseMove  byte = 0x10
 	MsgMouseClick byte = 0x11
 	MsgKeyEvent   byte = 0x12
+	MsgTextInput  byte = 0x13
+	MsgMouseWheel byte = 0x14
 )
 
 type Frame struct {
@@ -50,9 +52,19 @@ type MouseClick struct {
 	Down   byte
 }
 
+type MouseWheel struct {
+	X     uint16
+	Y     uint16
+	Delta int16
+}
+
 type KeyEvent struct {
 	KeyCode uint32
 	Down    byte
+}
+
+type TextInput struct {
+	Text string
 }
 
 func MarshalFrame(f Frame) []byte {
@@ -163,6 +175,26 @@ func ParseMouseClick(pkt []byte) (MouseClick, error) {
 	}, nil
 }
 
+func MarshalMouseWheel(m MouseWheel) []byte {
+	out := make([]byte, 7)
+	out[0] = MsgMouseWheel
+	binary.BigEndian.PutUint16(out[1:3], m.X)
+	binary.BigEndian.PutUint16(out[3:5], m.Y)
+	binary.BigEndian.PutUint16(out[5:7], uint16(m.Delta))
+	return out
+}
+
+func ParseMouseWheel(pkt []byte) (MouseWheel, error) {
+	if len(pkt) != 7 || pkt[0] != MsgMouseWheel {
+		return MouseWheel{}, errors.New("invalid mouse wheel packet")
+	}
+	return MouseWheel{
+		X:     binary.BigEndian.Uint16(pkt[1:3]),
+		Y:     binary.BigEndian.Uint16(pkt[3:5]),
+		Delta: int16(binary.BigEndian.Uint16(pkt[5:7])),
+	}, nil
+}
+
 func MarshalKeyEvent(k KeyEvent) []byte {
 	out := make([]byte, 6)
 	out[0] = MsgKeyEvent
@@ -181,12 +213,32 @@ func ParseKeyEvent(pkt []byte) (KeyEvent, error) {
 	}, nil
 }
 
+func MarshalTextInput(t TextInput) []byte {
+	data := []byte(t.Text)
+	out := make([]byte, 3+len(data))
+	out[0] = MsgTextInput
+	binary.BigEndian.PutUint16(out[1:3], uint16(len(data)))
+	copy(out[3:], data)
+	return out
+}
+
+func ParseTextInput(pkt []byte) (TextInput, error) {
+	if len(pkt) < 3 || pkt[0] != MsgTextInput {
+		return TextInput{}, errors.New("invalid text input packet")
+	}
+	n := int(binary.BigEndian.Uint16(pkt[1:3]))
+	if len(pkt) != 3+n {
+		return TextInput{}, errors.New("invalid text input length")
+	}
+	return TextInput{Text: string(pkt[3:])}, nil
+}
+
 func PacketType(pkt []byte) (byte, error) {
 	if len(pkt) == 0 {
 		return 0, errors.New("empty packet")
 	}
 	switch pkt[0] {
-	case MsgFrame, MsgCursor, MsgTileFrame, MsgMouseMove, MsgMouseClick, MsgKeyEvent:
+	case MsgFrame, MsgCursor, MsgTileFrame, MsgMouseMove, MsgMouseClick, MsgKeyEvent, MsgTextInput, MsgMouseWheel:
 		return pkt[0], nil
 	default:
 		return 0, fmt.Errorf("unknown packet type 0x%02x", pkt[0])

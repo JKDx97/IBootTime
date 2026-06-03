@@ -79,7 +79,7 @@ type Server struct {
 	pxeClients sync.Map // MAC -> time.Time
 
 	// UEFI IP pool: MAC -> assigned IP (net.IP)
-	uefiLeases sync.Map
+	uefiLeases  sync.Map
 	uefiNextIdx int // next index into the pool (round-robin)
 }
 
@@ -679,7 +679,7 @@ func (s *Server) getBootFilename(arch string, isIPXE, hasHTTP bool) string {
 		var file string
 		switch {
 		case strings.Contains(arch, "UEFI"):
-			file = "snp.efi"
+			file = "ipxe.efi"
 		default:
 			file = "undionly.kpxe"
 		}
@@ -766,7 +766,6 @@ func parseOptions(data []byte) map[byte][]byte {
 	}
 	return opts
 }
-
 
 func subOptionKeys(opts map[byte][]byte) []int {
 	keys := make([]int, 0, len(opts))

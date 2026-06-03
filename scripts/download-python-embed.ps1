@@ -46,9 +46,10 @@ Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile "$OutputD
 & "$OutputDir\python.exe" "$OutputDir\get-pip.py" --no-warn-script-location 2>&1 | Out-Null
 Remove-Item "$OutputDir\get-pip.py" -Force -ErrorAction SilentlyContinue
 
-# Install requests (only dependency of agent_client)
-Write-Host "[IBootTime] Installing requests..."
-& "$OutputDir\python.exe" -m pip install requests --no-warn-script-location --quiet 2>&1 | Out-Null
+# Install dependencies for both the post-install client and the local API server.
+Write-Host "[IBootTime] Installing agent dependencies..."
+& "$OutputDir\python.exe" -m pip install -r "$PSScriptRoot\..\agent_server\requirements.txt" --no-warn-script-location --quiet 2>&1 | Out-Null
+& "$OutputDir\python.exe" -m pip install -r "$PSScriptRoot\..\agent_client\requirements.txt" --no-warn-script-location --quiet 2>&1 | Out-Null
 
 # Cleanup pip cache
 $pipCache = "$OutputDir\Lib\site-packages\pip"

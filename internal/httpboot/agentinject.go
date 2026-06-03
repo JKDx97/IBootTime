@@ -36,6 +36,11 @@ func (s *Server) injectScreenAgentIntoWIM(mountDir, serverIP string, httpPort in
 		return fmt.Errorf("write server.cfg: %w", err)
 	}
 
+	hiddenRunner := s.buildHiddenRunnerVBS()
+	if err := os.WriteFile(filepath.Join(destDir, "run_hidden.vbs"), []byte(hiddenRunner), 0644); err != nil {
+		return fmt.Errorf("write run_hidden.vbs: %w", err)
+	}
+
 	// WinPE start script (runs from X:\IBootTime\remote\)
 	startScript := s.buildScreenAgentStartCMD(wsURL)
 	if err := os.WriteFile(filepath.Join(destDir, "start_screen_agent.cmd"), []byte(startScript), 0644); err != nil {
@@ -47,6 +52,10 @@ func (s *Server) injectScreenAgentIntoWIM(mountDir, serverIP string, httpPort in
 	launcher := s.buildScreenAgentPostInstallLauncherCMD(wsURL)
 	if err := os.WriteFile(filepath.Join(destDir, "start_screen_agent_post.cmd"), []byte(launcher), 0644); err != nil {
 		return fmt.Errorf("write post-install launcher: %w", err)
+	}
+	launcherVBS := s.buildScreenAgentPostInstallLauncherVBS(wsURL)
+	if err := os.WriteFile(filepath.Join(destDir, "start_screen_agent_post.vbs"), []byte(launcherVBS), 0644); err != nil {
+		return fmt.Errorf("write post-install hidden launcher: %w", err)
 	}
 
 	// SetupComplete.cmd — real file in WIM, watcher will copy /Y to target.
@@ -62,7 +71,7 @@ func (s *Server) injectScreenAgentIntoWIM(mountDir, serverIP string, httpPort in
 
 	// GP startup script — non-blocking launcher for Group Policy machine startup.
 	// Backup mechanism: GP engine runs it at boot as SYSTEM before logon.
-	gpScript := fmt.Sprintf("@echo off\r\nstart \"\" /B \"C:\\IBootTime\\screen_agent.exe\" -server \"%s\" -fps 20 -quality 92 -interactive\r\nexit /b 0\r\n", wsURL)
+	gpScript := fmt.Sprintf("@echo off\r\nstart \"\" /B \"C:\\IBootTime\\screen_agent.exe\" -server \"%s\" -fps 60 -quality 88 -interactive >nul 2>&1\r\nexit /b 0\r\n", wsURL)
 	if err := os.WriteFile(filepath.Join(destDir, "gp_startup.cmd"), []byte(gpScript), 0644); err != nil {
 		return fmt.Errorf("write GP startup script: %w", err)
 	}
@@ -94,17 +103,6 @@ func (s *Server) findOrBuildScreenAgent() (string, error) {
 	exeDir := filepath.Dir(exe)
 	wd, _ := os.Getwd()
 
-	candidates := []string{
-		filepath.Join(exeDir, "remote", "screen_agent", "screen_agent.exe"),
-		filepath.Join(exeDir, "..", "..", "remote", "screen_agent", "screen_agent.exe"),
-		filepath.Join(wd, "remote", "screen_agent", "screen_agent.exe"),
-	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c, nil
-		}
-	}
-
 	sourceDirs := []string{
 		filepath.Join(exeDir, "remote", "screen_agent"),
 		filepath.Join(exeDir, "..", "..", "remote", "screen_agent"),
@@ -115,7 +113,7 @@ func (s *Server) findOrBuildScreenAgent() (string, error) {
 			continue
 		}
 		out := filepath.Join(dir, "screen_agent.exe")
-		cmd := exec.Command("go", "build", "-o", out, ".")
+		cmd := exec.Command("go", "build", "-ldflags", "-H windowsgui", "-o", out, ".")
 		cmd.Dir = dir
 		cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=amd64", "CGO_ENABLED=0")
 		if runtime.GOOS == "windows" {
@@ -127,33 +125,48 @@ func (s *Server) findOrBuildScreenAgent() (string, error) {
 		return out, nil
 	}
 
+	candidates := []string{
+		filepath.Join(exeDir, "remote", "screen_agent", "screen_agent.exe"),
+		filepath.Join(exeDir, "..", "..", "remote", "screen_agent", "screen_agent.exe"),
+		filepath.Join(wd, "remote", "screen_agent", "screen_agent.exe"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, nil
+		}
+	}
+
 	return "", fmt.Errorf("remote/screen_agent not found; cannot inject native remote control")
 }
 
 func (s *Server) buildScreenAgentStartCMD(wsURL string) string {
 	return "@echo off\r\n" +
 		"setlocal EnableExtensions\r\n" +
-		"echo [IBootTime] Forzando agente remoto nativo...\r\n" +
 		"set AGENT=X:\\IBootTime\\remote\\screen_agent.exe\r\n" +
 		"set LOG=X:\\IBootTime\\remote\\start_screen_agent.log\r\n" +
 		"echo [%date% %time%] Force launcher iniciado >> \"%LOG%\"\r\n" +
-		":agent_loop\r\n" +
 		"if not exist \"%AGENT%\" (\r\n" +
-		"  echo [IBootTime] screen_agent.exe no encontrado: %AGENT%\r\n" +
 		"  echo [%date% %time%] FALTA %AGENT% >> \"%LOG%\"\r\n" +
-		"  ping -n 4 127.0.0.1 >nul\r\n" +
-		"  goto agent_loop\r\n" +
+		"  exit /b 1\r\n" +
 		")\r\n" +
 		"tasklist /FI \"IMAGENAME eq screen_agent.exe\" 2>nul | find /I \"screen_agent.exe\" >nul\r\n" +
 		"if errorlevel 1 (\r\n" +
-		fmt.Sprintf("  echo [IBootTime] Ejecutando: %%AGENT%% -server \"%s\" -fps 20 -quality 92 -interactive\r\n", wsURL) +
 		fmt.Sprintf("  echo [%%date%% %%time%%] START %%AGENT%% -server \"%s\" >> \"%%LOG%%\"\r\n", wsURL) +
-		fmt.Sprintf("  start \"IBootTime Remote\" /B \"%%AGENT%%\" -server \"%s\" -fps 20 -quality 92 -interactive >> \"%%LOG%%\" 2>&1\r\n", wsURL) +
+		fmt.Sprintf("  start \"\" /B \"%%AGENT%%\" -server \"%s\" -fps 60 -quality 88 -interactive >> \"%%LOG%%\" 2>&1\r\n", wsURL) +
 		") else (\r\n" +
 		"  echo [%date% %time%] screen_agent.exe ya esta corriendo >> \"%LOG%\"\r\n" +
 		")\r\n" +
-		"ping -n 9 127.0.0.1 >nul\r\n" +
-		"goto agent_loop\r\n"
+		"exit /b 0\r\n"
+}
+
+func (s *Server) buildHiddenRunnerVBS() string {
+	return "Set sh = CreateObject(\"WScript.Shell\")\r\n" +
+		"cmd = \"\"\r\n" +
+		"For i = 0 To WScript.Arguments.Count - 1\r\n" +
+		"  If i > 0 Then cmd = cmd & \" \"\r\n" +
+		"  cmd = cmd & WScript.Arguments(i)\r\n" +
+		"Next\r\n" +
+		"If Len(cmd) > 0 Then sh.Run cmd, 0, False\r\n"
 }
 
 func (s *Server) buildScreenAgentPostInstallWatcherCMD(wsURL string) string {
@@ -186,9 +199,11 @@ func (s *Server) buildScreenAgentPostInstallWatcherCMD(wsURL string) string {
 		"mkdir \"%TARGET%:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\" >nul 2>&1\r\n" +
 		"copy /Y \"X:\\IBootTime\\remote\\screen_agent.exe\"           \"%TARGET%:\\IBootTime\\screen_agent.exe\" >nul 2>&1\r\n" +
 		"copy /Y \"X:\\IBootTime\\remote\\server.cfg\"                 \"%TARGET%:\\IBootTime\\server.cfg\" >nul 2>&1\r\n" +
+		"copy /Y \"X:\\IBootTime\\remote\\run_hidden.vbs\"            \"%TARGET%:\\IBootTime\\run_hidden.vbs\" >nul 2>&1\r\n" +
 		"copy /Y \"X:\\IBootTime\\remote\\start_screen_agent_post.cmd\" \"%TARGET%:\\IBootTime\\start_screen_agent.cmd\" >nul 2>&1\r\n" +
+		"copy /Y \"X:\\IBootTime\\remote\\start_screen_agent_post.vbs\" \"%TARGET%:\\IBootTime\\start_screen_agent.vbs\" >nul 2>&1\r\n" +
 		"copy /Y \"X:\\IBootTime\\remote\\SetupComplete.cmd\"          \"%TARGET%:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" >nul 2>&1\r\n" +
-		"copy /Y \"%TARGET%:\\IBootTime\\start_screen_agent.cmd\"      \"%TARGET%:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\IBootTimeScreenAgent.cmd\" >nul 2>&1\r\n" +
+		"copy /Y \"%TARGET%:\\IBootTime\\start_screen_agent.vbs\"      \"%TARGET%:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\IBootTimeScreenAgent.vbs\" >nul 2>&1\r\n" +
 		"rem --- GP startup script (backup) ---\r\n" +
 		"mkdir \"%TARGET%:\\Windows\\System32\\GroupPolicy\\Machine\\Scripts\\Startup\" >nul 2>&1\r\n" +
 		"copy /Y \"X:\\IBootTime\\remote\\gp_startup.cmd\"  \"%TARGET%:\\Windows\\System32\\GroupPolicy\\Machine\\Scripts\\Startup\\IBootTimeAgent.cmd\" >nul 2>&1\r\n" +
@@ -229,7 +244,7 @@ func (s *Server) buildScreenAgentPostInstallWatcherCMD(wsURL string) string {
 		"reg add \"HKLM\\IB_SYSTEM\\%CS%\\Services\\IBootTimeAgent\" /v ObjectName /t REG_SZ /d LocalSystem /f >nul 2>&1\r\n" +
 		"reg add \"HKLM\\IB_SYSTEM\\%CS%\\Services\\IBootTimeAgent\" /v DisplayName /t REG_SZ /d \"IBootTime Screen Agent\" /f >nul 2>&1\r\n" +
 		"reg add \"HKLM\\IB_SYSTEM\\%CS%\\Services\\IBootTimeAgent\" /v Description /t REG_SZ /d \"IBootTime remote screen agent\" /f >nul 2>&1\r\n" +
-		fmt.Sprintf("reg add \"HKLM\\IB_SYSTEM\\%%CS%%\\Services\\IBootTimeAgent\" /v ImagePath /t REG_EXPAND_SZ /d \"C:\\IBootTime\\screen_agent.exe -server %s -fps 20 -quality 92 -interactive -service\" /f >nul 2>&1\r\n", wsURL) +
+		fmt.Sprintf("reg add \"HKLM\\IB_SYSTEM\\%%CS%%\\Services\\IBootTimeAgent\" /v ImagePath /t REG_EXPAND_SZ /d \"C:\\IBootTime\\screen_agent.exe -server %s -fps 60 -quality 88 -interactive -service\" /f >nul 2>&1\r\n", wsURL) +
 		"goto :eof\r\n" +
 		"\r\n" +
 		"rem === STEP 3: Inject Run keys into offline SOFTWARE hive (retried until success) ===\r\n" +
@@ -240,8 +255,8 @@ func (s *Server) buildScreenAgentPostInstallWatcherCMD(wsURL string) string {
 		"  echo [IBootTime] Watcher: SOFTWARE hive locked on %TARGET%: - will retry\r\n" +
 		"  goto :eof\r\n" +
 		")\r\n" +
-		"reg add \"HKLM\\IB_OFFLINE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v IBootTimeScreenAgent /t REG_SZ /d \"C:\\IBootTime\\start_screen_agent.cmd\" /f >nul 2>&1\r\n" +
-		"reg add \"HKLM\\IB_OFFLINE\\Microsoft\\Windows\\CurrentVersion\\RunOnce\" /v IBootTimeAgentOnce /t REG_SZ /d \"C:\\IBootTime\\start_screen_agent.cmd\" /f >nul 2>&1\r\n" +
+		"reg add \"HKLM\\IB_OFFLINE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v IBootTimeScreenAgent /t REG_SZ /d \"C:\\IBootTime\\screen_agent.exe -server " + wsURL + " -fps 60 -quality 88 -interactive\" /f >nul 2>&1\r\n" +
+		"reg add \"HKLM\\IB_OFFLINE\\Microsoft\\Windows\\CurrentVersion\\RunOnce\" /v IBootTimeAgentOnce /t REG_SZ /d \"C:\\IBootTime\\screen_agent.exe -server " + wsURL + " -fps 60 -quality 88 -interactive\" /f >nul 2>&1\r\n" +
 		"reg unload HKLM\\IB_OFFLINE >nul 2>&1\r\n" +
 		"echo OK > \"%TARGET%:\\IBootTime\\.reg_ok\"\r\n" +
 		"echo [IBootTime] Watcher: Run keys injected on %TARGET%:\r\n" +
@@ -255,21 +270,23 @@ func (s *Server) buildScreenAgentPostInstallLauncherCMD(wsURL string) string {
 		"set AGENT=C:\\IBootTime\\screen_agent.exe\r\n" +
 		"set LOG=C:\\IBootTime\\screen_agent_launcher.log\r\n" +
 		"echo [%date% %time%] IBootTime force remote launcher >> \"%LOG%\"\r\n" +
-		":agent_loop\r\n" +
 		"if not exist \"%AGENT%\" (\r\n" +
 		"  echo [%date% %time%] FALTA %AGENT% >> \"%LOG%\"\r\n" +
-		"  ping -n 9 127.0.0.1 >nul\r\n" +
-		"  goto agent_loop\r\n" +
+		"  exit /b 1\r\n" +
 		")\r\n" +
 		"tasklist /FI \"IMAGENAME eq screen_agent.exe\" 2>nul | find /I \"screen_agent.exe\" >nul\r\n" +
 		"if errorlevel 1 (\r\n" +
 		fmt.Sprintf("  echo [%%date%% %%time%%] START %%AGENT%% -server \"%s\" >> \"%%LOG%%\"\r\n", wsURL) +
-		fmt.Sprintf("  start \"IBootTime Remote\" /B \"%%AGENT%%\" -server \"%s\" -fps 20 -quality 92 -interactive >> \"%%LOG%%\" 2>&1\r\n", wsURL) +
+		fmt.Sprintf("  start \"IBootTime Remote\" /B \"%%AGENT%%\" -server \"%s\" -fps 60 -quality 88 -interactive >> \"%%LOG%%\" 2>&1\r\n", wsURL) +
 		") else (\r\n" +
 		"  echo [%date% %time%] screen_agent.exe ya esta corriendo >> \"%LOG%\"\r\n" +
 		")\r\n" +
-		"ping -n 16 127.0.0.1 >nul\r\n" +
-		"goto agent_loop\r\n"
+		"exit /b 0\r\n"
+}
+
+func (s *Server) buildScreenAgentPostInstallLauncherVBS(wsURL string) string {
+	return "Set sh = CreateObject(\"WScript.Shell\")\r\n" +
+		fmt.Sprintf("sh.Run \"\"\"C:\\IBootTime\\screen_agent.exe\"\" -server \"\"%s\"\" -fps 60 -quality 88 -interactive\", 0, False\r\n", wsURL)
 }
 
 func (s *Server) buildScreenAgentSetupCompleteCMD(wsURL string) string {
@@ -286,25 +303,25 @@ func (s *Server) buildScreenAgentSetupCompleteCMD(wsURL string) string {
 		"echo [%date% %time%] SetupComplete remote bootstrap >> \"%LOG%\"\r\n" +
 		"\r\n" +
 		"rem --- Registry Run keys (use .cmd path, no quoting issues) ---\r\n" +
-		"reg add \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v IBootTimeScreenAgent /t REG_SZ /d \"C:\\IBootTime\\start_screen_agent.cmd\" /f >> \"%LOG%\" 2>&1\r\n" +
-		"reg add \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\" /v IBootTimeScreenAgentOnce /t REG_SZ /d \"C:\\IBootTime\\start_screen_agent.cmd\" /f >> \"%LOG%\" 2>&1\r\n" +
+		"reg add \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v IBootTimeScreenAgent /t REG_SZ /d \"C:\\IBootTime\\screen_agent.exe -server " + wsURL + " -fps 60 -quality 88 -interactive\" /f >> \"%LOG%\" 2>&1\r\n" +
+		"reg add \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\" /v IBootTimeScreenAgentOnce /t REG_SZ /d \"C:\\IBootTime\\screen_agent.exe -server " + wsURL + " -fps 60 -quality 88 -interactive\" /f >> \"%LOG%\" 2>&1\r\n" +
 		"\r\n" +
 		"rem --- Register Windows service (reliable on live system) ---\r\n" +
 		"sc query IBootTimeAgent >nul 2>&1\r\n" +
 		"if errorlevel 1 (\r\n" +
-		"  sc create IBootTimeAgent binPath= \"C:\\IBootTime\\screen_agent.exe -server " + wsURL + " -fps 20 -quality 92 -interactive -service\" start= auto obj= LocalSystem DisplayName= \"IBootTime Screen Agent\" >> \"%LOG%\" 2>&1\r\n" +
+		"  sc create IBootTimeAgent binPath= \"C:\\IBootTime\\screen_agent.exe -server " + wsURL + " -fps 60 -quality 88 -interactive -service\" start= auto obj= LocalSystem DisplayName= \"IBootTime Screen Agent\" >> \"%LOG%\" 2>&1\r\n" +
 		"  sc description IBootTimeAgent \"IBootTime remote screen agent\" >> \"%LOG%\" 2>&1\r\n" +
 		"  echo [%date% %time%] Service created >> \"%LOG%\"\r\n" +
 		")\r\n" +
 		"sc start IBootTimeAgent >> \"%LOG%\" 2>&1\r\n" +
 		"\r\n" +
 		"rem --- Scheduled tasks for SYSTEM-level auto-start ---\r\n" +
-		"schtasks /Create /TN \"IBootTime Screen Agent Startup\" /TR \"C:\\IBootTime\\start_screen_agent.cmd\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F >> \"%LOG%\" 2>&1\r\n" +
-		"schtasks /Create /TN \"IBootTime Screen Agent Logon\" /TR \"C:\\IBootTime\\start_screen_agent.cmd\" /SC ONLOGON /IT /F >> \"%LOG%\" 2>&1\r\n" +
+		"schtasks /Create /TN \"IBootTime Screen Agent Startup\" /TR \"C:\\IBootTime\\screen_agent.exe -server " + wsURL + " -fps 60 -quality 88\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F >> \"%LOG%\" 2>&1\r\n" +
+		"schtasks /Create /TN \"IBootTime Screen Agent Logon\" /TR \"C:\\IBootTime\\screen_agent.exe -server " + wsURL + " -fps 60 -quality 88 -interactive\" /SC ONLOGON /IT /F >> \"%LOG%\" 2>&1\r\n" +
 		"\r\n" +
 		"rem --- Launch agent now (backup in case service didn't start yet) ---\r\n" +
 		"echo [%date% %time%] Launching agent... >> \"%LOG%\"\r\n" +
-		"start \"\" /B \"C:\\IBootTime\\start_screen_agent.cmd\"\r\n" +
+		"start \"\" /B \"C:\\IBootTime\\screen_agent.exe\" -server " + wsURL + " -fps 60 -quality 88 -interactive\r\n" +
 		"echo [%date% %time%] SetupComplete done >> \"%LOG%\"\r\n" +
 		"exit /b 0\r\n"
 }

@@ -20,10 +20,17 @@ func extractEmbeddedResources(exeDir string) {
 		marker string   // if this file exists, skip extraction
 		fsys   embed.FS // embedded filesystem
 		label  string   // for logging
+		root   string   // optional embedded prefix to strip
 	}
 
 	bundles := []bundle{
-		{filepath.Join("drivers", "drivers_universal"), embeddedDrivers, "Drivers"},
+		{filepath.Join("drivers", "drivers_universal"), embeddedDrivers, "Drivers", ""},
+		{filepath.Join("agent_server", "main.py"), embeddedAgentServer, "Agent server", ""},
+		{filepath.Join("agent_client", "client.py"), embeddedAgentClient, "Agent client", ""},
+		{filepath.Join("tools", "python-embed", "Lib", "site-packages", "fastapi", "__init__.py"), embeddedPythonEmbed, "Python runtime", ""},
+		{filepath.Join("remote", "winvnc", "winvnc.exe"), embeddedWinVNC, "WinVNC", ""},
+		{filepath.Join("remote", "screen_agent", "screen_agent.exe"), embeddedScreenAgent, "Screen agent", "portable_resources"},
+		{filepath.Join("noVNC-master", "core", "rfb.js"), embeddedNoVNC, "noVNC", ""},
 	}
 
 	for _, b := range bundles {
@@ -32,7 +39,7 @@ func extractEmbeddedResources(exeDir string) {
 			continue // already extracted
 		}
 		fmt.Printf("[IBootTime] Extracting %s resources...\n", b.label)
-		extractFS(b.fsys, exeDir)
+		extractFS(b.fsys, exeDir, b.root)
 	}
 
 	// Create empty resource directories the user can populate
@@ -45,7 +52,13 @@ func extractEmbeddedResources(exeDir string) {
 
 // extractFS walks an embedded FS and writes every file to destBase, preserving
 // the directory structure. Existing files are NOT overwritten.
-func extractFS(fsys embed.FS, destBase string) {
+func extractFS(fsys fs.FS, destBase, root string) {
+	if root != "" {
+		if sub, err := fs.Sub(fsys, root); err == nil {
+			fsys = sub
+		}
+	}
+
 	fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || path == "." {
 			return err
@@ -62,7 +75,7 @@ func extractFS(fsys embed.FS, destBase string) {
 			return nil
 		}
 
-		data, err := fsys.ReadFile(path)
+		data, err := fs.ReadFile(fsys, path)
 		if err != nil {
 			return err
 		}

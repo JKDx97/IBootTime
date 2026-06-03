@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -22,13 +23,14 @@ import (
 )
 
 const (
-	defaultFPS     = 20
-	defaultQuality = 92
+	// Fast-network profile: target fluid realtime control while keeping JPEG encode cost sane.
+	defaultFPS     = 60
+	defaultQuality = 88
 	installPath    = `C:\IBootTime\screen_agent.exe`
 	setupComplete  = `C:\Windows\Setup\Scripts\SetupComplete.cmd`
 	runOnceKey     = `HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce`
 	runKey         = `HKLM\Software\Microsoft\Windows\CurrentVersion\Run`
-	startupCMD     = `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\IBootTimeScreenAgent.cmd`
+	startupCMD     = `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\IBootTimeScreenAgent.vbs`
 )
 
 func main() {
@@ -54,8 +56,15 @@ func main() {
 
 	if runtime.GOOS == "windows" && *service {
 		log.Printf("starting as Windows service (server=%s)", *server)
+		supervisorLock, ok := acquireSupervisorLock()
+		if !ok {
+			log.Printf("another screen agent supervisor is already running; exiting service instance")
+			return
+		}
+		defer supervisorLock.Release()
 		if err := runAsService(*server, *fps, *quality); err != nil {
 			log.Printf("service dispatcher failed: %v — falling back to interactive", err)
+			supervisorLock.Release()
 			// Fall through to normal mode (useful when testing from command line)
 		} else {
 			return
@@ -69,6 +78,12 @@ func main() {
 		}
 		if !isWinPE() && !session.InActiveConsoleSession() {
 			log.Printf("starting supervisor mode; capture/input will be launched in the active console session")
+			supervisorLock, ok := acquireSupervisorLock()
+			if !ok {
+				log.Printf("another screen agent supervisor is already running; exiting")
+				return
+			}
+			defer supervisorLock.Release()
 			session.SuperviseInteractive(*server, *fps, *quality, log.Printf)
 			return
 		}
@@ -76,6 +91,13 @@ func main() {
 			log.Printf("interactive mode requested; proceeding with capture regardless of session")
 		}
 	}
+
+	agentLock, ok := acquireAgentLock()
+	if !ok {
+		log.Printf("another interactive screen agent is already running; exiting")
+		return
+	}
+	defer agentLock.Release()
 
 	log.Printf("starting interactive capture/input mode")
 	runForever(*server, *fps, *quality)
@@ -133,6 +155,7 @@ func runSession(server string, fps, quality int) error {
 	if err != nil {
 		return err
 	}
+	u = withClientID(u)
 	log.Printf("dialing remote server %s", u.String())
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 10 * time.Second
@@ -202,6 +225,48 @@ func runSession(server string, fps, quality int) error {
 	return err
 }
 
+func withClientID(u *url.URL) *url.URL {
+	copyURL := *u
+	if strings.Trim(copyURL.Query().Get("client_id"), " ") != "" || strings.HasPrefix(copyURL.Path, "/ws/remote/") {
+		return &copyURL
+	}
+
+	clientID := detectClientID(&copyURL)
+	if clientID == "" {
+		return &copyURL
+	}
+	copyURL.Path = strings.TrimRight(copyURL.Path, "/") + "/" + url.PathEscape(clientID)
+	return &copyURL
+}
+
+func detectClientID(u *url.URL) string {
+	host := u.Hostname()
+	port := u.Port()
+	if host != "" {
+		if port == "" {
+			switch u.Scheme {
+			case "wss":
+				port = "443"
+			default:
+				port = "80"
+			}
+		}
+		conn, err := net.DialTimeout("udp", net.JoinHostPort(host, port), 2*time.Second)
+		if err == nil {
+			defer conn.Close()
+			if local, ok := conn.LocalAddr().(*net.UDPAddr); ok && local.IP != nil {
+				if ip := local.IP.String(); ip != "" && ip != "::" {
+					return ip
+				}
+			}
+		}
+	}
+	if hostname, err := os.Hostname(); err == nil {
+		return hostname
+	}
+	return ""
+}
+
 func ensurePersistence(server string, fps, quality int) error {
 	winPE := isWinPE()
 	if !winPE {
@@ -210,6 +275,9 @@ func ensurePersistence(server string, fps, quality int) error {
 		}
 		if err := ensureStartupCMD(server, fps, quality); err != nil {
 			log.Printf("Startup warning: %v", err)
+		}
+		if err := ensureScheduledTask(server, fps, quality); err != nil {
+			log.Printf("Scheduled task warning: %v", err)
 		}
 		return nil
 	}
@@ -290,7 +358,7 @@ func setupLogging(interactive bool) {
 		)
 	}
 
-	writers := []io.Writer{os.Stdout}
+	var writers []io.Writer
 	var opened []string
 	var failures []string
 	for _, path := range uniqueStrings(paths) {
@@ -306,7 +374,11 @@ func setupLogging(interactive bool) {
 		writers = append(writers, f)
 		opened = append(opened, path)
 	}
-	log.SetOutput(io.MultiWriter(writers...))
+	if len(writers) == 0 {
+		log.SetOutput(io.Discard)
+	} else {
+		log.SetOutput(io.MultiWriter(writers...))
+	}
 	log.Printf("logging mode=%s pid=%d paths=%s", mode, pid, strings.Join(opened, "; "))
 	if len(opened) == 0 {
 		log.Printf("logging warning: no file log could be opened")
@@ -388,19 +460,19 @@ func writeSetupCompleteAt(path, server string, fps, quality int, driveLetter run
 
 func ensureRunOnce(server string, fps, quality int) error {
 	cmdLine := fmt.Sprintf(`"%s" -server "%s" -fps %d -quality %d -interactive`, installPath, server, fps, quality)
-	return exec.Command("reg", "add", runOnceKey, "/v", "IBootTimeScreenAgent", "/t", "REG_SZ", "/d", cmdLine, "/f").Run()
+	return hiddenCommand("reg", "add", runOnceKey, "/v", "IBootTimeScreenAgent", "/t", "REG_SZ", "/d", cmdLine, "/f").Run()
 }
 
 func ensureRun(server string, fps, quality int) error {
 	cmdLine := fmt.Sprintf(`"%s" -server "%s" -fps %d -quality %d -interactive`, installPath, server, fps, quality)
-	return exec.Command("reg", "add", runKey, "/v", "IBootTimeScreenAgent", "/t", "REG_SZ", "/d", cmdLine, "/f").Run()
+	return hiddenCommand("reg", "add", runKey, "/v", "IBootTimeScreenAgent", "/t", "REG_SZ", "/d", cmdLine, "/f").Run()
 }
 
 func ensureStartupCMD(server string, fps, quality int) error {
 	if err := os.MkdirAll(filepath.Dir(startupCMD), 0755); err != nil {
 		return err
 	}
-	line := fmt.Sprintf("@echo off\r\nstart \"\" /B \"%s\" -server \"%s\" -fps %d -quality %d -interactive\r\n", installPath, server, fps, quality)
+	line := fmt.Sprintf("Set sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"\"\"%s\"\" -server \"\"%s\"\" -fps %d -quality %d -interactive\", 0, False\r\n", installPath, server, fps, quality)
 	return os.WriteFile(startupCMD, []byte(line), 0644)
 }
 
@@ -413,7 +485,7 @@ func ensureScheduledTask(server string, fps, quality int) error {
 		}
 	}
 	tr := fmt.Sprintf(`"%s" -server "%s" -fps %d -quality %d`, installPath, server, fps, quality)
-	return exec.Command(schtasks, "/Create", "/TN", "IBootTimeScreenAgent", "/TR", tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F").Run()
+	return hiddenCommand(schtasks, "/Create", "/TN", "IBootTimeScreenAgent", "/TR", tr, "/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST", "/F").Run()
 }
 
 func copyFile(src, dst string) error {

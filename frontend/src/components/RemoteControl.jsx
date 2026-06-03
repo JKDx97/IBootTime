@@ -29,14 +29,17 @@ export default function RemoteControl() {
       ip: client.ip,
       port: serverStatus?.httpPort || 8080,
       mac: client.mac,
+      clientId: client.ip || client.mac,
     })
   }
 
   const handleManualConnect = () => {
+    const target = manualIP || serverStatus?.ip || '127.0.0.1'
     setActiveClient({
-      ip: manualIP || serverStatus?.ip || '127.0.0.1',
+      ip: target,
       port: serverStatus?.httpPort || 8080,
       mac: 'manual',
+      clientId: target,
     })
   }
 
@@ -59,7 +62,7 @@ export default function RemoteControl() {
         <div className="flex items-center gap-3 px-4 py-2 bg-slate-900 border-b border-slate-700 shrink-0">
           <ScreenShare size={16} className="text-emerald-400" />
           <span className="text-sm font-semibold text-white">Control Remoto</span>
-          <span className="text-xs text-slate-400 font-mono">ws://{serverStatus?.ip || '127.0.0.1'}:{serverStatus?.httpPort || 8080}/ws/remote</span>
+          <span className="text-xs text-slate-400 font-mono">ws://{serverStatus?.ip || '127.0.0.1'}:{serverStatus?.httpPort || 8080}/ws/remote/{activeClient.clientId}</span>
           <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-400">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
             Conectado
@@ -84,6 +87,7 @@ export default function RemoteControl() {
           <RemoteViewer
             serverIP={serverStatus?.ip || '127.0.0.1'}
             httpPort={serverStatus?.httpPort || 8080}
+            clientId={activeClient.clientId}
           />
         </div>
       </div>
@@ -133,7 +137,7 @@ export default function RemoteControl() {
           </button>
         </div>
         <p className="text-xs text-slate-500">
-          El agente debe conectarse a ws://{serverStatus?.ip || 'SERVIDOR'}:{serverStatus?.httpPort || 8080}/ws/remote.
+          El agente se separa por cliente en ws://{serverStatus?.ip || 'SERVIDOR'}:{serverStatus?.httpPort || 8080}/ws/remote/&lt;IP-del-cliente&gt;.
         </p>
       </div>
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,6 +86,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/health", s.handleHealth)
 	// Native remote control endpoint.
 	mux.HandleFunc("/ws/remote", s.handleScreenRemote)
+	mux.HandleFunc("/ws/remote/", s.handleScreenRemote)
 	// Legacy WinPE/VNC endpoints are still registered as a compatibility
 	// fallback for boot.wim caches or clients built before the native agent.
 	mux.HandleFunc("/ws/vnc", s.handleVNCProxy)
@@ -189,7 +191,7 @@ func (s *Server) cleanupSMBShares() {
 
 const smbUser = "Administrador"
 const smbPass = "P0s31d0n"
-const cacheVersion = "v60-conditional-safe-unattend"
+const cacheVersion = "v74-sources-setup-no-tempdrive"
 
 // safeNetDriveLetters lists drive letters safe for net use in WinPE.
 // Avoids: A/B (floppy), C (system), D (common CD/HDD), E (common),
@@ -211,6 +213,14 @@ func (s *Server) computeCacheVersion() string {
 	return fmt.Sprintf("%s|ip=%s|port=%d|vnc=%v|vncport=%d|user=%s|%s",
 		cacheVersion, s.serverIP, s.port,
 		s.cfg.GetWinPERemote(), s.cfg.GetWinPEVncPort(), smbUser, driverTag)
+}
+
+func (s *Server) computeISOCacheVersion(isoName string) string {
+	unattendTag := "user-unattend=0"
+	if s.isoMgr.GetUnattend(isoName) != "" {
+		unattendTag = "user-unattend=1"
+	}
+	return s.computeCacheVersion() + "|" + unattendTag
 }
 
 // preloadBootWimCache scans disk for previously cached boot.wim files and
@@ -237,7 +247,7 @@ func (s *Server) preloadBootWimCache() {
 		if _, err := os.Stat(cachedWim); err != nil {
 			continue
 		}
-		fullVersion := s.computeCacheVersion()
+		fullVersion := s.computeISOCacheVersion(iso.Name)
 		if data, err := os.ReadFile(versionFile); err != nil || string(data) != fullVersion {
 			continue
 		}
@@ -427,9 +437,15 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 	s.log.Info("HTTP", "Found boot.wim: %s", srcBootWim)
 
 	isoRoot := isoDrive + ":\\"
-	useSafeUnattend := hasEmbeddedUnattend(isoRoot)
-	setupCommand := buildSetupExeCommand(driveLetter, useSafeUnattend)
-	if useSafeUnattend {
+	hasUserUnattend := s.isoMgr.GetUnattend(iso.Name) != ""
+	rootUnattend := findRootAutounattend(isoRoot)
+	hasEmbedded := rootUnattend != "" || hasEmbeddedUnattend(isoRoot)
+	setupCommand := buildSetupExeCommand(driveLetter, hasUserUnattend, rootUnattend, hasEmbedded)
+	if hasUserUnattend {
+		s.log.Info("HTTP", "User autounattend configured for %s; downloading in WinPE before setup", iso.Name)
+	} else if rootUnattend != "" {
+		s.log.Info("HTTP", "Root autounattend detected in %s; launching setup with ISO answer file", iso.Name)
+	} else if hasEmbedded {
 		s.log.Info("HTTP", "Embedded unattend detected in %s; launching setup with safe unattend override", iso.Name)
 	} else {
 		s.log.Info("HTTP", "No embedded unattend detected in %s; launching setup without /unattend", iso.Name)
@@ -453,7 +469,7 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 
 	// Version marker — includes server IP, port, and VNC config so WIM is
 	// rebuilt automatically whenever the network environment changes.
-	fullVersion := s.computeCacheVersion()
+	fullVersion := s.computeISOCacheVersion(iso.Name)
 	versionFile := filepath.Join(cacheDir, ".version")
 	if versionData, err := os.ReadFile(versionFile); err == nil && string(versionData) == fullVersion {
 		// version matches — keep existing rebuild decision
@@ -605,10 +621,19 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					"echo.\r\n"+
 					"echo ===== PUNTO 4: Lanzando setup.exe =====\r\n"+
 					"%s\r\n"+ // 14: setup command
-					"echo ===== PUNTO 5: setup termino (err=%%errorlevel%%) =====\r\n"+
-					"echo [IBootTime] El instalador se cerro.\r\n"+
+					"set IB_SETUP_RC=%%errorlevel%%\r\n"+
+					"if \"%%IB_SETUP_RC%%\"==\"0\" goto setup_handoff\r\n"+
+					"if \"%%IB_SETUP_RC%%\"==\"31\" goto setup_handoff\r\n"+
+					"echo ===== PUNTO 5: setup termino con error %%IB_SETUP_RC%% =====\r\n"+
+					"echo [IBootTime] El instalador se cerro antes de entregar la instalacion.\r\n"+
 					"echo Para reintentar: %s\r\n"+ // 15: setup command
 					"cmd /k\r\n"+
+					":setup_handoff\r\n"+
+					"echo [IBootTime] Windows Setup fue iniciado correctamente (codigo %%IB_SETUP_RC%%).\r\n"+
+					"echo [IBootTime] Manteniendo WinPE activo mientras continua la instalacion...\r\n"+
+					":keepalive\r\n"+
+					"ping -n 60 127.0.0.1 >nul\r\n"+
+					"goto keepalive\r\n"+
 					":fail\r\n"+
 					"echo [IBootTime] Error de conexion despues de 30 intentos.\r\n"+
 					"echo.\r\n"+
@@ -630,6 +655,15 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 					driveLetter, s.serverIP, shareName, smbUser, smbPass, // 16-20: fail net use
 					setupCommand, // 21: fail setup
 				)
+
+				if hasUserUnattend {
+					downloadScript := buildUserUnattendDownloadScript(s.serverIP, s.port, iso.Name)
+					startnetContent = strings.Replace(startnetContent,
+						"echo ===== PUNTO 4: Lanzando setup.exe =====\r\n",
+						downloadScript+"echo ===== PUNTO 4: Lanzando setup.exe =====\r\n",
+						1,
+					)
+				}
 			} else {
 				// Index 1 (plain WinPE): wpeinit + network init + wait for IP + net use
 				startnetContent = fmt.Sprintf("@echo off\r\n"+
@@ -703,8 +737,8 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 				if err := s.injectScreenAgentIntoWIM(idxMountDir, s.serverIP, s.port); err != nil {
 					s.log.Warn("HTTP", "Native remote injection index %d (non-fatal): %v", idx, err)
 				} else {
-					bootstrapLine := "\r\n:: IBootTime Native Remote Post-Install Bootstrap\r\nstart \"\" /B cmd /c X:\\IBootTime\\remote\\install_post_screen_agent.cmd\r\n\r\n"
-					remoteLine := "\r\n:: IBootTime Native Remote Control - forced direct start + watchdog\r\nstart \"\" /B X:\\IBootTime\\remote\\screen_agent.exe -server \"ws://" + s.serverIP + fmt.Sprintf(":%d/ws/remote", s.port) + "\" -fps 20 -quality 92 -interactive\r\nstart \"\" /B cmd /c X:\\IBootTime\\remote\\start_screen_agent.cmd\r\n\r\n"
+					bootstrapLine := "\r\n:: IBootTime Native Remote Post-Install Bootstrap\r\nif exist X:\\Windows\\System32\\wscript.exe (wscript.exe X:\\IBootTime\\remote\\run_hidden.vbs \"cmd.exe /c X:\\IBootTime\\remote\\install_post_screen_agent.cmd\") else (start \"\" /MIN cmd /c X:\\IBootTime\\remote\\install_post_screen_agent.cmd)\r\n\r\n"
+					remoteLine := "\r\n:: IBootTime Native Remote Control - hidden direct start\r\nstart \"\" /B X:\\IBootTime\\remote\\screen_agent.exe -server \"ws://" + s.serverIP + fmt.Sprintf(":%d/ws/remote", s.port) + "\" -fps 60 -quality 88 -interactive >nul 2>&1\r\nif exist X:\\Windows\\System32\\wscript.exe (wscript.exe X:\\IBootTime\\remote\\run_hidden.vbs \"cmd.exe /c X:\\IBootTime\\remote\\start_screen_agent.cmd\") else (start \"\" /MIN cmd /c X:\\IBootTime\\remote\\start_screen_agent.cmd)\r\n\r\n"
 					if strings.Contains(startnetContent, "echo [IBootTime] Servidor alcanzado.\r\n") {
 						startnetContent = strings.Replace(startnetContent, "echo [IBootTime] Servidor alcanzado.\r\n", "echo [IBootTime] Servidor alcanzado.\r\n"+bootstrapLine, 1)
 					} else if strings.Contains(startnetContent, "echo [IBootTime] Servidor alcanzado. Conectando") {
@@ -775,12 +809,52 @@ func (s *Server) prepareWindowsInstall(iso *isomgr.ISOInfo, driveLetter string) 
 	return shareName, nil
 }
 
-func buildSetupExeCommand(driveLetter string, useSafeUnattend bool) string {
-	cmd := fmt.Sprintf("%s:\\setup.exe", driveLetter)
-	if useSafeUnattend {
+func buildSetupExeCommand(driveLetter string, hasUserUnattend bool, rootUnattend string, hasEmbeddedUnattend bool) string {
+	cmd := fmt.Sprintf(`cmd /c "cd /d %s:\sources && setup.exe`, driveLetter)
+	if hasUserUnattend {
+		cmd += " /unattend:X:\\IBootTime\\autounattend.xml"
+	} else if rootUnattend != "" {
+		cmd += fmt.Sprintf(" /unattend:%s:\\%s", driveLetter, rootUnattend)
+	} else if hasEmbeddedUnattend {
 		cmd += " /unattend:X:\\IBootTime\\safe-unattend.xml"
 	}
-	return cmd
+	return cmd + `"`
+}
+
+func buildUserUnattendDownloadScript(serverIP string, port int, isoName string) string {
+	endpoint := fmt.Sprintf("http://%s:%d/api/iso-unattend?iso=%s", serverIP, port, url.QueryEscape(isoName))
+	return fmt.Sprintf("echo ===== PUNTO 3A: descargando autounattend.xml =====\r\n"+
+		"mkdir X:\\IBootTime >nul 2>&1\r\n"+
+		"set IB_UNATTEND_URL=%s\r\n"+
+		"set IB_UNATTEND_FILE=X:\\IBootTime\\autounattend.xml\r\n"+
+		"if exist X:\\IBootTime\\vnc\\curl.exe (\r\n"+
+		"  X:\\IBootTime\\vnc\\curl.exe -f -L -o \"%%IB_UNATTEND_FILE%%\" \"%%IB_UNATTEND_URL%%\"\r\n"+
+		") else if exist X:\\Windows\\System32\\curl.exe (\r\n"+
+		"  X:\\Windows\\System32\\curl.exe -f -L -o \"%%IB_UNATTEND_FILE%%\" \"%%IB_UNATTEND_URL%%\"\r\n"+
+		") else (\r\n"+
+		"  curl.exe -f -L -o \"%%IB_UNATTEND_FILE%%\" \"%%IB_UNATTEND_URL%%\"\r\n"+
+		")\r\n"+
+		"if not exist \"%%IB_UNATTEND_FILE%%\" (\r\n"+
+		"  echo [IBootTime] ERROR: No se pudo descargar autounattend.xml\r\n"+
+		"  cmd /k\r\n"+
+		")\r\n"+
+		"echo [IBootTime] autounattend.xml descargado OK\r\n"+
+		"echo.\r\n",
+		endpoint)
+}
+
+func findRootAutounattend(isoRoot string) string {
+	candidates := []string{
+		"autounattend.xml",
+		"Autounattend.xml",
+		"AUTOUNATTEND.XML",
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(filepath.Join(isoRoot, candidate)); err == nil {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func hasEmbeddedUnattend(isoRoot string) bool {

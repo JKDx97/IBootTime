@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"iboottime/screen_agent/desktop"
@@ -25,9 +26,11 @@ const (
 	mouseeventfRightUp    = 0x0010
 	mouseeventfMiddleDown = 0x0020
 	mouseeventfMiddleUp   = 0x0040
+	mouseeventfWheel      = 0x0800
 	mouseeventfAbsolute   = 0x8000
 
-	keyeventfKeyUp = 0x0002
+	keyeventfKeyUp   = 0x0002
+	keyeventfUnicode = 0x0004
 
 	smCXScreen = 0
 	smCYScreen = 1
@@ -151,12 +154,24 @@ func (c *Controller) handleDirect(pkt []byte) error {
 			return err
 		}
 		return c.ClickAt(int(m.X), int(m.Y), m.Button, m.Down != 0)
+	case protocol.MsgMouseWheel:
+		m, err := protocol.ParseMouseWheel(pkt)
+		if err != nil {
+			return err
+		}
+		return c.WheelAt(int(m.X), int(m.Y), int(m.Delta))
 	case protocol.MsgKeyEvent:
 		k, err := protocol.ParseKeyEvent(pkt)
 		if err != nil {
 			return err
 		}
 		return c.Key(k.KeyCode, k.Down != 0)
+	case protocol.MsgTextInput:
+		t, err := protocol.ParseTextInput(pkt)
+		if err != nil {
+			return err
+		}
+		return c.Text(t.Text)
 	default:
 		return fmt.Errorf("unsupported input packet 0x%02x", pkt[0])
 	}
@@ -214,6 +229,21 @@ func (c *Controller) ClickAt(x, y int, button byte, down bool) error {
 	return sendMouse(mouseInput{DwFlags: flags})
 }
 
+func (c *Controller) WheelAt(x, y int, delta int) error {
+	if delta == 0 {
+		return nil
+	}
+	desktop.AttachInputDesktop()
+	if x >= 0 && y >= 0 {
+		if ok, _, err := procSetCursorPos.Call(uintptr(x), uintptr(y)); ok == 0 {
+			log.Printf("input warning: SetCursorPos before wheel (%d,%d) failed: %v", x, y, err)
+		}
+		time.Sleep(4 * time.Millisecond)
+	}
+	log.Printf("input wheel delta=%d x=%d y=%d", delta, x, y)
+	return sendMouse(mouseInput{MouseData: uint32(int32(delta)), DwFlags: mouseeventfWheel})
+}
+
 func (c *Controller) Key(keycode uint32, down bool) error {
 	var flags uint32
 	if !down {
@@ -222,6 +252,19 @@ func (c *Controller) Key(keycode uint32, down bool) error {
 	scan, _, _ := procMapVirtualKey.Call(uintptr(keycode), 0)
 	log.Printf("input key vk=0x%x scan=0x%x down=%t", keycode, scan, down)
 	return sendKeyboard(keyboardInput{WVk: uint16(keycode), WScan: uint16(scan), DwFlags: flags})
+}
+
+func (c *Controller) Text(text string) error {
+	desktop.AttachInputDesktop()
+	for _, unit := range utf16.Encode([]rune(text)) {
+		if err := sendKeyboard(keyboardInput{WScan: unit, DwFlags: keyeventfUnicode}); err != nil {
+			return err
+		}
+		if err := sendKeyboard(keyboardInput{WScan: unit, DwFlags: keyeventfUnicode | keyeventfKeyUp}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Controller) absolute(x, y int) (int32, int32) {
